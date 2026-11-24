@@ -128,6 +128,32 @@ static void eval_poly_rect(const safety_zone_t *z, float w, float h,
     *out_dist = min_d;
 }
 
+static void smooth_bbox(uint16_t *x, uint16_t *y, uint16_t *w, uint16_t *h) {
+    static float sm_x = -1.0f, sm_y = -1.0f, sm_w = -1.0f, sm_h = -1.0f;
+    if (!x || !y || !w || !h) return;
+    if (*w == 0 || *h == 0) {
+        sm_x = -1.0f;
+        return;
+    }
+    const float alpha = 1.0f;
+    if (sm_x < 0.0f) {
+        sm_x = (float)(*x);
+        sm_y = (float)(*y);
+        sm_w = (float)(*w);
+        sm_h = (float)(*h);
+    } else {
+        sm_x = sm_x * (1.0f - alpha) + ((float)(*x)) * alpha;
+        sm_y = sm_y * (1.0f - alpha) + ((float)(*y)) * alpha;
+        sm_w = sm_w * (1.0f - alpha) + ((float)(*w)) * alpha;
+        sm_h = sm_h * (1.0f - alpha) + ((float)(*h)) * alpha;
+    }
+    *x = (uint16_t)(sm_x + 0.5f);
+    *y = (uint16_t)(sm_y + 0.5f);
+    *w = (uint16_t)(sm_w + 0.5f);
+    *h = (uint16_t)(sm_h + 0.5f);
+}
+
+
 int main(int argc, char **argv) {
     const char *cfg_path = "workcell.conf";
     int opt;
@@ -223,38 +249,96 @@ int main(int argc, char **argv) {
 
         float thresh = fmaxf((float)cfg.diff_threshold, 38.0f);
         const uint32_t CELL = 8;
-        uint32_t cols = w / CELL;
-        uint32_t rows = h / CELL;
-        uint16_t min_x = (uint16_t)w, min_y = (uint16_t)h, max_x = 0, max_y = 0;
-        uint32_t valid_cells = 0;
+    uint32_t cols = w / CELL;
+    uint32_t rows = h / CELL;
+    uint16_t min_x = (uint16_t)w, min_y = (uint16_t)h, max_x = 0, max_y = 0;
+    uint32_t valid_cells = 0;
 
-        for (uint32_t cy = 0; cy < rows; cy++) {
-            for (uint32_t cx = 0; cx < cols; cx++) {
-                uint32_t x0 = cx * CELL;
-                uint32_t y0 = cy * CELL;
-                if (x0 < 6 || y0 < 6 || x0 + CELL + 6 > w || y0 + CELL + 6 > h) continue;
+    uint8_t active_grid[64][64];
+    uint8_t visited_grid[64][64];
+    for (uint32_t r = 0; r < 64; r++) {
+        for (uint32_t c = 0; c < 64; c++) {
+            active_grid[r][c] = 0;
+            visited_grid[r][c] = 0;
+        }
+    }
+    uint32_t max_r = rows < 64 ? rows : 64;
+    uint32_t max_c = cols < 64 ? cols : 64;
 
-                uint32_t hits = 0;
-                for (uint32_t dy = 0; dy < CELL; dy++) {
-                    for (uint32_t dx = 0; dx < CELL; dx++) {
-                        size_t idx = (size_t)(y0 + dy) * w + (x0 + dx);
-                        if (fabsf((float)smooth_buf[idx] - bg_model[idx]) > thresh) hits++;
-                    }
+    for (uint32_t cy = 0; cy < max_r; cy++) {
+        for (uint32_t cx = 0; cx < max_c; cx++) {
+            uint32_t x0 = cx * CELL;
+            uint32_t y0 = cy * CELL;
+            if (x0 < 6 || y0 < 6 || x0 + CELL + 6 > w || y0 + CELL + 6 > h) continue;
+
+            uint32_t hits = 0;
+            for (uint32_t dy = 0; dy < CELL; dy++) {
+                for (uint32_t dx = 0; dx < CELL; dx++) {
+                    size_t idx = (size_t)(y0 + dy) * w + (x0 + dx);
+                    if (fabsf((float)smooth_buf[idx] - bg_model[idx]) > thresh) hits++;
                 }
-                if (hits >= 18U) {
-                    valid_cells++;
-                    if ((uint16_t)x0 < min_x) min_x = (uint16_t)x0;
-                    if ((uint16_t)(x0 + CELL - 1) > max_x) max_x = (uint16_t)(x0 + CELL - 1);
-                    if ((uint16_t)y0 < min_y) min_y = (uint16_t)y0;
-                    if ((uint16_t)(y0 + CELL - 1) > max_y) max_y = (uint16_t)(y0 + CELL - 1);
-                }
+            }
+            if (hits >= 34U) {
+                active_grid[cy][cx] = 1;
             }
         }
+    }
 
-        if (valid_cells == 0) {
-            for (size_t i = 0; i < total_px; i++) {
-                bg_model[i] = (1.0f - cfg.bg_alpha) * bg_model[i] + cfg.bg_alpha * (float)smooth_buf[i];
+    // Extract only the largest 4-connected blob so trailing ghost cells never stretch the bbox
+    uint16_t qx[4096], qy[4096];
+    for (uint32_t cy = 0; cy < max_r; cy++) {
+        for (uint32_t cx = 0; cx < max_c; cx++) {
+            if (!active_grid[cy][cx] || visited_grid[cy][cx]) continue;
+            uint32_t head = 0, tail = 0;
+            uint16_t c_min_x = (uint16_t)w, c_min_y = (uint16_t)h, c_max_x = 0, c_max_y = 0;
+            visited_grid[cy][cx] = 1;
+            qx[tail] = (uint16_t)cx;
+            qy[tail] = (uint16_t)cy;
+            tail++;
+
+            while (head < tail) {
+                uint16_t ux = qx[head];
+                uint16_t uy = qy[head];
+                head++;
+
+                uint16_t px0 = (uint16_t)(ux * CELL);
+                uint16_t py0 = (uint16_t)(uy * CELL);
+                if (px0 < c_min_x) c_min_x = px0;
+                if (px0 + CELL - 1 > c_max_x) c_max_x = (uint16_t)(px0 + CELL - 1);
+                if (py0 < c_min_y) c_min_y = py0;
+                if (py0 + CELL - 1 > c_max_y) c_max_y = (uint16_t)(py0 + CELL - 1);
+
+                const int ddx[4] = {-1, 1, 0, 0};
+                const int ddy[4] = {0, 0, -1, 1};
+                for (int k = 0; k < 4; k++) {
+                    int nx = (int)ux + ddx[k];
+                    int ny = (int)uy + ddy[k];
+                    if (nx >= 0 && ny >= 0 && (uint32_t)nx < max_c && (uint32_t)ny < max_r) {
+                        if (active_grid[ny][nx] && !visited_grid[ny][nx]) {
+                            visited_grid[ny][nx] = 1;
+                            qx[tail] = (uint16_t)nx;
+                            qy[tail] = (uint16_t)ny;
+                            tail++;
+                        }
+                    }
+                }
             }
+
+            if (tail > valid_cells) {
+                valid_cells = tail;
+                min_x = c_min_x;
+                min_y = c_min_y;
+                max_x = c_max_x;
+                max_y = c_max_y;
+            }
+        }
+    }
+
+        // Strict background-only update: adapt pixels close to current background, or slowly clear stale ghost trails
+        for (size_t i = 0; i < total_px; i++) {
+            float diff = fabsf((float)smooth_buf[i] - bg_model[i]);
+            float rate = (diff < 18.0f) ? 0.05f : 0.005f;
+            bg_model[i] = (1.0f - rate) * bg_model[i] + rate * (float)smooth_buf[i];
         }
 
         uint8_t intrusion = 0;
@@ -262,13 +346,29 @@ int main(int argc, char **argv) {
         uint16_t bx = 0, by = 0, bw = 0, bh = 0;
 
         if (valid_cells >= 4U) {
+            uint16_t px0 = max_x, py0 = max_y, px1 = min_x, py1 = min_y;
+            for (uint32_t yy = min_y; yy <= max_y && yy < h; yy++) {
+                for (uint32_t xx = min_x; xx <= max_x && xx < w; xx++) {
+                    if (fabsf((float)smooth_buf[yy * w + xx] - bg_model[yy * w + xx]) > thresh) {
+                        if ((uint16_t)xx < px0) px0 = (uint16_t)xx;
+                        if ((uint16_t)xx > px1) px1 = (uint16_t)xx;
+                        if ((uint16_t)yy < py0) py0 = (uint16_t)yy;
+                        if ((uint16_t)yy > py1) py1 = (uint16_t)yy;
+                    }
+                }
+            }
+            if (px1 >= px0 && py1 >= py0) { min_x = px0; min_y = py0; max_x = px1; max_y = py1; }
             bx = min_x;
             by = min_y;
             bw = (uint16_t)(max_x - min_x + 1);
             bh = (uint16_t)(max_y - min_y + 1);
+            smooth_bbox(&bx, &by, &bw, &bh);
             eval_poly_rect(&live_zone, (float)w, (float)h,
-                           (float)min_x, (float)min_y, (float)max_x, (float)max_y,
+                           (float)bx, (float)by, (float)(bx + bw - 1), (float)(by + bh - 1),
                            &intrusion, &dist_px);
+            if (!intrusion && dist_px <= 15.0f) {
+                intrusion = 1;
+            }
         }
 
         vision_report_t report = {

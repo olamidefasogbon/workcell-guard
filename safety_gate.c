@@ -173,6 +173,11 @@ static int io_devctl(resmgr_context_t *ctp, io_devctl_t *msg, RESMGR_OCB_T *ocb)
             fault_latched = 0;
             current_state = STATE_SAFE_RUN;
             seen_first_frame = 0;
+            last_heartbeat_ns = now_ns();
+            last_report.intrusion_detected = 0;
+            last_report.min_zone_distance_px = 999.0f;
+            last_report.bbox_w = 0;
+            last_report.bbox_h = 0;
             printf("[DEVCTL] Safety interlock reset -> OSSD 24V ARMED (SAFE_RUN)\n");
             fflush(stdout);
             msg->o.ret_val = 0;

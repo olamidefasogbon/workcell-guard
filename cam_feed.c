@@ -1,3 +1,4 @@
+#include <devctl.h>
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -112,7 +113,7 @@ static void *ingest_thread(void *arg) {
     return NULL;
 }
 
-static void render_synthetic_frame(uint8_t *buf, uint32_t w, uint32_t h, uint32_t fid) {
+static void render_synthetic_frame(uint8_t *buf, uint32_t w, uint32_t h, uint32_t fid, float target_cx, float target_cy) {
     // Rich industrial workcell floor & stamping bed grid
     for (uint32_t y = 0; y < h; y++) {
         uint8_t base = (uint8_t)(28 + (y * 18) / h);
@@ -128,9 +129,11 @@ static void render_synthetic_frame(uint8_t *buf, uint32_t w, uint32_t h, uint32_
     }
 
     // Smoothly patrolling operator / AGV arm that periodically approaches & enters right-side zone
-    float phase = (float)(fid % 240U) / 240.0f * 2.0f * 3.1415926f;
-    float norm_x = 0.34f + 0.26f * sinf(phase); // Sweeps from x=0.08 (safe) to x=0.60 (intrusion)
-    float norm_y = 0.52f + 0.14f * cosf(phase * 0.5f);
+        float phase = (float)(fid % 240U) / 240.0f * 2.0f * 3.1415926f;
+    float progress = 0.5f - 0.5f * cosf(phase);
+    float start_x = (target_cx > 0.5f) ? 0.12f : 0.88f;
+    float norm_x  = start_x + (target_cx - start_x) * progress;
+    float norm_y  = target_cy;
 
     int cx = (int)(norm_x * (float)w);
     int cy = (int)(norm_y * (float)h);
@@ -178,6 +181,7 @@ int main(int argc, char **argv) {
     if (cam == MAP_FAILED) { perror("mmap"); return EXIT_FAILURE; }
     memset(cam, 0, sizeof(shm_camera_t));
 
+    int gate_fd = open(cfg.device_path, O_RDONLY);
     pthread_t itid;
     pthread_create(&itid, NULL, ingest_thread, NULL);
 
@@ -206,7 +210,18 @@ int main(int argc, char **argv) {
             memcpy(cam->pixels, custom_frames + (size_t)custom_idx * bytes, bytes);
             custom_idx = (custom_idx + 1) % custom_count;
         } else {
-            render_synthetic_frame(cam->pixels, w, h, fid);
+            float tcx = 0.81f, tcy = 0.525f;
+            if (gate_fd < 0) gate_fd = open(cfg.device_path, O_RDONLY);
+            if (gate_fd >= 0) {
+                safety_status_t st;
+                if (devctl(gate_fd, DCMD_SAFETY_GET_STATUS, &st, sizeof(st), NULL) == 0 && st.zone.num_pts >= 3) {
+                    float sx = 0.0f, sy = 0.0f;
+                    for (uint32_t i = 0; i < st.zone.num_pts; i++) { sx += st.zone.vx[i]; sy += st.zone.vy[i]; }
+                    tcx = sx / (float)st.zone.num_pts;
+                    tcy = sy / (float)st.zone.num_pts;
+                }
+            }
+            render_synthetic_frame(cam->pixels, w, h, fid, tcx, tcy);
         }
         pthread_mutex_unlock(&clip_lock);
 

@@ -323,6 +323,12 @@ HTML_PAGE = """<!DOCTYPE html>
           </div>
           <div class="btn-row" style="margin-top:8px;">
             <button onclick="useSynthetic()">Use Synthetic Workcell Feed</button>
+
+<div style="display:flex;gap:8px;margin-top:8px;">
+  <button type="button" onclick="startSimFeed()" style="flex:1;">Start Simulation</button>
+  <button type="button" onclick="loadSampleRealVideo()" style="flex:1;">Load Sample Real Video</button>
+</div>
+
           </div>
         </div>
       </div>
@@ -518,20 +524,47 @@ async function sendPolygonToQnx() {
   pushLog('WARN', 'DEVCTL', `DCMD_SAFETY_SET_ZONE pushed ${polyPts.length}-vertex custom polygon to /dev/safety_gate`);
 }
 
+let latchStateLocal = 1;
+let actionInFlight = false;
+
 async function resetGate() {
-  await fetch('/api/reset', { method: 'POST' });
-  pushLog('OK', 'DEVCTL', 'DCMD_SAFETY_RESET -> Interlock cleared, OSSD 24.0V DC re-energized');
+  if (actionInFlight) return;
+  actionInFlight = true;
+  try {
+    await fetch('/api/reset', { method: 'POST' });
+    await pollTelemetry();
+    pushLog('OK', 'DEVCTL', 'DCMD_SAFETY_RESET -> Interlock cleared, OSSD 24.0V DC re-energized');
+  } finally {
+    actionInFlight = false;
+  }
 }
 
 async function toggleLatch() {
-  const next = (telem && telem.latch_enabled) ? 0 : 1;
-  await fetch('/api/latch', { method: 'POST', body: JSON.stringify({ enabled: next }) });
-  pushLog('WARN', 'DEVCTL', `DCMD_SAFETY_SET_LATCH -> ISO 13849-1 Latch Mode ${next ? 'ENABLED' : 'DISABLED'}`);
+  if (actionInFlight) return;
+  actionInFlight = true;
+  try {
+    const cur = (telem && typeof telem.latch_enabled === 'number') ? telem.latch_enabled : latchStateLocal;
+    const next = cur ? 0 : 1;
+    latchStateLocal = next;
+    document.getElementById('latchBtn').innerText = 'Latch Mode: ' + (next ? 'ON' : 'OFF');
+    await fetch('/api/latch', { method: 'POST', body: JSON.stringify({ enabled: next }) });
+    await pollTelemetry();
+    pushLog('WARN', 'DEVCTL', `DCMD_SAFETY_SET_LATCH -> ISO 13849-1 Latch Mode ${next ? 'ENABLED' : 'DISABLED'}`);
+  } finally {
+    actionInFlight = false;
+  }
 }
 
 async function triggerChaos() {
-  pushLog('DANGER', 'CHAOS', 'Injecting SIGKILL into vision_worker PID -> testing QNX 150ms watchdog & 250ms supervisor...');
-  await fetch('/api/chaos', { method: 'POST' });
+  if (actionInFlight) return;
+  actionInFlight = true;
+  try {
+    pushLog('DANGER', 'CHAOS', 'Injecting SIGKILL into vision_worker PID -> testing QNX 150ms watchdog & 250ms supervisor...');
+    await fetch('/api/chaos', { method: 'POST' });
+    setTimeout(pollTelemetry, 60);
+  } finally {
+    actionInFlight = false;
+  }
 }
 
 const dz = document.getElementById('dropzone');
@@ -822,6 +855,24 @@ async function frameLoop() {
 telemetryLoop();
 frameLoop();
 requestAnimationFrame(renderLoop);
+
+async function startSimFeed() {
+  await fetch('/api/use-synthetic', { method: 'POST' });
+  await fetch('/api/reset', { method: 'POST' });
+  pushLog('OK', 'CAM_FEED', 'Started synthetic workcell simulation');
+}
+
+async function loadSampleRealVideo() {
+  pushLog('WARN', 'INGEST', 'Loading sample real video from disk...');
+  const r = await fetch('/api/load-sample', { method: 'POST' });
+  const j = await r.json();
+  if (j.ok) {
+    pushLog('OK', 'INGEST', `Loaded ${j.filename} (${j.frames} frames) -> /dev/shmem/workcell_cam`);
+  } else {
+    pushLog('DANGER', 'INGEST', j.error || 'Failed to load sample video');
+  }
+}
+
 </script>
 </body>
 </html>
@@ -867,6 +918,7 @@ class FrameClient:
             chunks.append(part)
             got += len(part)
         return b"".join(chunks)
+
 
 def decode_video_to_gray_frames(raw_bytes, filename, w=320, h=240, max_frames=450):
     if filename.lower().endswith(".bin") and len(raw_bytes) >= 12:
@@ -988,6 +1040,25 @@ class Handler(BaseHTTPRequestHandler):
                 w, h, nframes, blob = decode_video_to_gray_frames(raw, fname)
                 push_frames_to_qnx(self.qnx_ip, self.ingest_port, w, h, nframes, blob)
                 self._json({"ok": True, "frames": nframes})
+            except Exception as exc:
+                self._json({"ok": False, "error": str(exc)})
+            return
+
+        if self.path == "/api/load-sample":
+            try:
+                search_dirs = [Path("."), Path.home() / "Downloads", Path.home() / "Desktop"]
+                vids = []
+                for d in search_dirs:
+                    if d.exists():
+                        vids.extend(sorted(d.glob("*.mp4"), key=lambda x: x.stat().st_mtime, reverse=True))
+                        vids.extend(sorted(d.glob("*.mov"), key=lambda x: x.stat().st_mtime, reverse=True))
+                if not vids:
+                    self._json({"ok": False, "error": "No .mp4 or .mov found in project folder, Downloads, or Desktop"})
+                    return
+                chosen = vids[0]
+                w, h, nframes, blob = decode_video_to_gray_frames(chosen.read_bytes(), chosen.name)
+                push_frames_to_qnx(self.qnx_ip, self.ingest_port, w, h, nframes, blob)
+                self._json({"ok": True, "filename": chosen.name, "frames": nframes})
             except Exception as exc:
                 self._json({"ok": False, "error": str(exc)})
             return

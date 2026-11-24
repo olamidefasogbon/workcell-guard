@@ -50,16 +50,16 @@ static inline void config_set_defaults(workcell_config_t *cfg) {
     cfg->diff_threshold       = 35;
     cfg->bg_alpha             = 0.02f;
     cfg->min_blob_ratio       = 0.005f;
-    cfg->latch_faults         = 1;
+    cfg->latch_faults         = 0;
     cfg->telemetry_port       = 9876;
     cfg->cam_ingest_port      = 9877;
     cfg->frame_stream_port    = 9878;
 
     cfg->zone.num_pts = 4;
-    cfg->zone.vx[0] = 0.50f; cfg->zone.vy[0] = 0.20f;
-    cfg->zone.vx[1] = 0.92f; cfg->zone.vy[1] = 0.20f;
-    cfg->zone.vx[2] = 0.92f; cfg->zone.vy[2] = 0.85f;
-    cfg->zone.vx[3] = 0.50f; cfg->zone.vy[3] = 0.85f;
+    cfg->zone.vx[0] = 0.68f; cfg->zone.vy[0] = 0.25f;
+    cfg->zone.vx[1] = 0.94f; cfg->zone.vy[1] = 0.25f;
+    cfg->zone.vx[2] = 0.94f; cfg->zone.vy[2] = 0.80f;
+    cfg->zone.vx[3] = 0.68f; cfg->zone.vy[3] = 0.80f;
 }
 
 static inline int config_load(const char *path, workcell_config_t *cfg) {
@@ -67,7 +67,7 @@ static inline int config_load(const char *path, workcell_config_t *cfg) {
     FILE *f = fopen(path, "r");
     if (!f) return -1;
 
-    float zx1 = 0.50f, zy1 = 0.20f, zx2 = 0.92f, zy2 = 0.85f;
+    float zx1 = 0.68f, zy1 = 0.25f, zx2 = 0.94f, zy2 = 0.80f;
     char line[256];
     while (fgets(line, sizeof(line), f)) {
         char *p = line;
