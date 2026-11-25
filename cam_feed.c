@@ -11,22 +11,27 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
 #include "config_loader.h"
+#include "net_acl.h"
 #include "safety_protocol.h"
 
 #define CAM_INGEST_MAGIC 0x43414D38U // "CAM8"
 #define MAX_CUSTOM_FRAMES 450
+#define MAX_CUSTOM_BYTES  (64U * 1024U * 1024U)
+#define INGEST_RECV_TIMEOUT_S 5
 
 static workcell_config_t cfg;
 static pthread_mutex_t clip_lock = PTHREAD_MUTEX_INITIALIZER;
-static uint8_t *custom_frames = NULL;
+static uint8_t *custom_frames = NULL;     // guarded by clip_lock (with everything below)
 static uint32_t custom_w = 0;
 static uint32_t custom_h = 0;
 static uint32_t custom_count = 0;
 static uint32_t custom_idx = 0;
+static uint32_t stream_epoch = 1;         // bumped on every stream swap so vision re-seeds deterministically
 
 static uint64_t now_ns(void) {
     struct timespec ts;
@@ -39,7 +44,7 @@ static int recv_exact(int fd, void *buf, size_t len) {
     uint8_t *p = (uint8_t *)buf;
     while (got < len) {
         ssize_t n = recv(fd, p + got, len - got, 0);
-        if (n <= 0) return -1;
+        if (n <= 0) return -1;     // includes receive timeout
         got += (size_t)n;
     }
     return 0;
@@ -47,7 +52,7 @@ static int recv_exact(int fd, void *buf, size_t len) {
 
 static void *ingest_thread(void *arg) {
     (void)arg;
-    int port = (cfg.cam_ingest_port > 0) ? cfg.cam_ingest_port : 9877;
+    int port = cfg.cam_ingest_port;
 
     int srv = socket(AF_INET, SOCK_STREAM, 0);
     if (srv < 0) { perror("cam ingest socket"); return NULL; }
@@ -71,8 +76,18 @@ static void *ingest_thread(void *arg) {
     fflush(stdout);
 
     while (1) {
-        int cli = accept(srv, NULL, NULL);
+        struct sockaddr_in peer;
+        socklen_t plen = sizeof(peer);
+        int cli = accept(srv, (struct sockaddr *)&peer, &plen);
         if (cli < 0) continue;
+
+        if (!acl_allows(&cfg, &peer)) {
+            fprintf(stderr, "[cam_feed] ingest refused from %s\n", inet_ntoa(peer.sin_addr));
+            close(cli);
+            continue;
+        }
+        struct timeval tv = { INGEST_RECV_TIMEOUT_S, 0 };
+        setsockopt(cli, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
         uint32_t hdr[4];
         if (recv_exact(cli, hdr, sizeof(hdr)) == 0 && hdr[0] == CAM_INGEST_MAGIC) {
@@ -82,17 +97,24 @@ static void *ingest_thread(void *arg) {
 
             if (n == 0) {
                 pthread_mutex_lock(&clip_lock);
-                free(custom_frames);
-                custom_frames = NULL;
-                custom_count = 0;
-                custom_idx = 0;
+                if (custom_frames) {
+                    free(custom_frames);
+                    custom_frames = NULL;
+                    custom_count = 0;
+                    custom_idx = 0;
+                    stream_epoch++;
+                }
                 pthread_mutex_unlock(&clip_lock);
-                printf("[cam_feed] Switched back to synthetic workcell stream\n");
+                printf("[cam_feed] Synthetic workcell stream active\n");
                 fflush(stdout);
-            } else if (w >= 16 && h >= 16 && (size_t)w * h <= MAX_FRAME_PIXELS && n <= MAX_CUSTOM_FRAMES) {
+            } else if (w >= 16 && h >= 16 && w <= MAX_FRAME_DIM && h <= MAX_FRAME_DIM &&
+                       (size_t)w * h <= MAX_FRAME_PIXELS && n <= MAX_CUSTOM_FRAMES &&
+                       (uint64_t)w * h * n <= MAX_CUSTOM_BYTES) {
                 size_t total = (size_t)w * h * n;
                 uint8_t *buf = (uint8_t *)malloc(total);
-                if (buf && recv_exact(cli, buf, total) == 0) {
+                if (!buf) {
+                    fprintf(stderr, "[cam_feed] ingest: out of memory for %zu bytes - keeping current stream\n", total);
+                } else if (recv_exact(cli, buf, total) == 0) {
                     pthread_mutex_lock(&clip_lock);
                     free(custom_frames);
                     custom_frames = buf;
@@ -100,12 +122,16 @@ static void *ingest_thread(void *arg) {
                     custom_h = h;
                     custom_count = n;
                     custom_idx = 0;
+                    stream_epoch++;
                     pthread_mutex_unlock(&clip_lock);
                     printf("[cam_feed] Hot-swapped live video clip (%ux%u, %u frames)\n", w, h, n);
                     fflush(stdout);
                 } else {
+                    fprintf(stderr, "[cam_feed] ingest: incomplete clip - keeping current stream\n");
                     free(buf);
                 }
+            } else {
+                fprintf(stderr, "[cam_feed] ingest: rejected clip header (%ux%u x %u)\n", w, h, n);
             }
         }
         close(cli);
@@ -128,8 +154,8 @@ static void render_synthetic_frame(uint8_t *buf, uint32_t w, uint32_t h, uint32_
         }
     }
 
-    // Smoothly patrolling operator / AGV arm that periodically approaches & enters right-side zone
-        float phase = (float)(fid % 240U) / 240.0f * 2.0f * 3.1415926f;
+    // Smoothly patrolling operator / AGV arm that periodically approaches & enters the zone
+    float phase = (float)(fid % 240U) / 240.0f * 2.0f * 3.1415926f;
     float progress = 0.5f - 0.5f * cosf(phase);
     float start_x = (target_cx > 0.5f) ? 0.12f : 0.88f;
     float norm_x  = start_x + (target_cx - start_x) * progress;
@@ -159,20 +185,20 @@ int main(int argc, char **argv) {
     int opt;
     while ((opt = getopt(argc, argv, "c:")) != -1) {
         if (opt == 'c') cfg_path = optarg;
+        else return EXIT_FAILURE;
     }
 
-    config_load(cfg_path, &cfg);
-    if (cfg.sim_width == 0 || cfg.sim_width > 1280) cfg.sim_width = 320;
-    if (cfg.sim_height == 0 || cfg.sim_height > 720) cfg.sim_height = 240;
-    if (cfg.target_fps <= 0) cfg.target_fps = 30;
+    if (config_load(cfg_path, &cfg) != 0) return EXIT_FAILURE;
+    acl_warn_if_open(&cfg, "cam_feed");
 
     struct sched_param sp;
     memset(&sp, 0, sizeof(sp));
     sp.sched_priority = cfg.prio_camera;
-    sched_setscheduler(0, SCHED_FIFO, &sp);
+    if (sched_setscheduler(0, SCHED_FIFO, &sp) != 0) perror("sched_setscheduler (continuing)");
 
+    // Owner-only: only a privileged producer may write frames the safety function trusts.
     shm_unlink(cfg.shm_name);
-    int shm_fd = shm_open(cfg.shm_name, O_CREAT | O_RDWR, 0666);
+    int shm_fd = shm_open(cfg.shm_name, O_CREAT | O_RDWR | O_EXCL, 0600);
     if (shm_fd < 0) { perror("shm_open"); return EXIT_FAILURE; }
     if (ftruncate(shm_fd, sizeof(shm_camera_t)) == -1) { perror("ftruncate"); return EXIT_FAILURE; }
 
@@ -181,9 +207,11 @@ int main(int argc, char **argv) {
     if (cam == MAP_FAILED) { perror("mmap"); return EXIT_FAILURE; }
     memset(cam, 0, sizeof(shm_camera_t));
 
-    int gate_fd = open(cfg.device_path, O_RDONLY);
+    int gate_fd = open(cfg.device_path, O_RDONLY);   // optional: only used to aim the synthetic operator at the zone
     pthread_t itid;
-    pthread_create(&itid, NULL, ingest_thread, NULL);
+    if (pthread_create(&itid, NULL, ingest_thread, NULL) != 0) {
+        fprintf(stderr, "[cam_feed] cannot start ingest thread - synthetic stream only\n");
+    }
 
     printf("[cam_feed] Online at Prio %d | %ux%u @ %d FPS -> %s\n",
            cfg.prio_camera, cfg.sim_width, cfg.sim_height, cfg.target_fps, cfg.shm_name);
@@ -191,7 +219,9 @@ int main(int argc, char **argv) {
 
     uint32_t fid = 0;
     uint32_t seq = 0;
-    useconds_t frame_us = (useconds_t)(1000000 / cfg.target_fps);
+    const long period_ns = 1000000000L / cfg.target_fps;
+    struct timespec next;
+    clock_gettime(CLOCK_MONOTONIC, &next);
 
     while (1) {
         fid++;
@@ -199,10 +229,12 @@ int main(int argc, char **argv) {
         uint32_t h = cfg.sim_height;
 
         seq++;
-        cam->write_seq = seq; // Odd = write in progress
-        __sync_synchronize();
+        __atomic_store_n(&cam->write_seq, seq, __ATOMIC_RELAXED);   // odd = write in progress
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
 
+        uint32_t epoch;
         pthread_mutex_lock(&clip_lock);
+        epoch = stream_epoch;
         if (custom_frames && custom_count > 0) {
             w = custom_w;
             h = custom_h;
@@ -214,7 +246,8 @@ int main(int argc, char **argv) {
             if (gate_fd < 0) gate_fd = open(cfg.device_path, O_RDONLY);
             if (gate_fd >= 0) {
                 safety_status_t st;
-                if (devctl(gate_fd, DCMD_SAFETY_GET_STATUS, &st, sizeof(st), NULL) == 0 && st.zone.num_pts >= 3) {
+                if (devctl(gate_fd, DCMD_SAFETY_GET_STATUS, &st, sizeof(st), NULL) == 0 &&
+                    zone_validate(&st.zone) == ZONE_OK) {
                     float sx = 0.0f, sy = 0.0f;
                     for (uint32_t i = 0; i < st.zone.num_pts; i++) { sx += st.zone.vx[i]; sy += st.zone.vy[i]; }
                     tcx = sx / (float)st.zone.num_pts;
@@ -228,13 +261,21 @@ int main(int argc, char **argv) {
         cam->width = w;
         cam->height = h;
         cam->frame_id = fid;
+        cam->stream_epoch = epoch;
         cam->capture_timestamp_ns = now_ns();
 
-        __sync_synchronize();
         seq++;
-        cam->write_seq = seq; // Even = consistent frame ready
+        __atomic_store_n(&cam->write_seq, seq, __ATOMIC_RELEASE);   // even = consistent frame ready
 
-        usleep(frame_us);
+        // Absolute-time period: no drift, and no burst of catch-up frames after a stall.
+        next.tv_nsec += period_ns;
+        while (next.tv_nsec >= 1000000000L) { next.tv_nsec -= 1000000000L; next.tv_sec++; }
+        struct timespec nowts;
+        clock_gettime(CLOCK_MONOTONIC, &nowts);
+        if (nowts.tv_sec > next.tv_sec || (nowts.tv_sec == next.tv_sec && nowts.tv_nsec > next.tv_nsec + period_ns)) {
+            next = nowts;
+        }
+        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
     }
 
     return 0;

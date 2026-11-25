@@ -1,3 +1,10 @@
 __pycache__/
 *.py[cod]
 nul
+build/
+# QNX build outputs
+/cam_feed
+/safety_gate
+/supervisor
+/telemetry_bridge
+/vision_worker
