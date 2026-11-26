@@ -12,7 +12,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
 
 # v2 telemetry: original fields + fault/reset/heartbeat/camera fields (must match telemetry_bridge.c)
 PKT_FMT = "<IiiiIIIQQfHHHHHH I 8f 8f i i i I I I I I i"
@@ -669,6 +669,17 @@ const RESET_REASON = {
   0: 'ok', 1: 'no fresh vision heartbeat', 2: 'hazard still present', 3: 'settling (scene must stay clear)', 4: 'invalid zone'
 };
 
+// A single missed poll (busy link, tunnel hiccup) is shown as STALE. Only a sustained gap is COMMS LOST.
+// The gate fails safe on its own within ~150 ms, so this delay only affects what the operator SEES.
+const LINK_LOST_MS = 1200;
+let lastGoodTelemetryMs = Date.now();
+
+function onTelemetryMiss() {
+  if (Date.now() - lastGoodTelemetryMs > LINK_LOST_MS) { showLinkLost(); return; }
+  const t = document.getElementById('stateText');
+  if (t && !t.innerText.includes('STALE')) t.innerText += ' • STALE DATA';
+}
+
 // Telemetry is gone: never keep showing the last good "24 V / running". Unknown means STOPPED.
 function showLinkLost() {
   telem = null;
@@ -689,7 +700,8 @@ async function pollTelemetry() {
   try {
     const res = await fetch('/api/telemetry');
     const d = await res.json();
-    if (!d.ok) { showLinkLost(); return; }
+    if (!d.ok) { onTelemetryMiss(); return; }
+    lastGoodTelemetryMs = Date.now();
     telem = d;
     if (!connected) {
       connected = true;
@@ -750,7 +762,7 @@ async function pollTelemetry() {
         pushLog('OK', 'OK', `Curtain clear (${clr}) | OSSD 24.0V DC | Press 120 SPM | IPC ${d.latency_us} us`);
       }
     }
-  } catch (e) { showLinkLost(); }
+  } catch (e) { onTelemetryMiss(); }
 }
 
 async function pollFrame() {
@@ -920,8 +932,10 @@ async function telemetryLoop() {
 }
 
 async function frameLoop() {
+  const t0 = performance.now();
   await pollFrame();
-  setTimeout(frameLoop, 45);
+  const took = performance.now() - t0;
+  setTimeout(frameLoop, Math.max(45, took));   // never poll faster than the link can deliver frames
 }
 
 telemetryLoop();
@@ -1078,14 +1092,22 @@ class Handler(BaseHTTPRequestHandler):
             self._json(t if t else {"ok": False, "error": "no telemetry from QNX node"})
 
     web_port = 8080
+    allowed_hosts = {"localhost", "127.0.0.1"}   # hostnames only (a tunnel changes the port); add more with --allow-host
+    read_only = False
+
+    @staticmethod
+    def _hostname(value):
+        return (urlparse("//" + value).hostname or "").lower() if value else ""
 
     def _origin_ok(self):
-        # Blocks cross-site requests (a web page in this browser POSTing /api/reset) and DNS rebinding.
-        hosts = (f"localhost:{self.web_port}", f"127.0.0.1:{self.web_port}")
-        if self.headers.get("Host", "") not in hosts:
+        # Blocks cross-site requests (another web page POSTing /api/reset) and DNS rebinding:
+        # both the Host header and, when present, the Origin header must name an allowed host.
+        if self._hostname(self.headers.get("Host", "")) not in self.allowed_hosts:
             return False
         origin = self.headers.get("Origin")
-        return origin is None or origin in tuple("http://" + h for h in hosts)
+        if origin is None:
+            return True
+        return (urlparse(origin).hostname or "").lower() in self.allowed_hosts
 
     def _do_reset(self):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as rs:
@@ -1099,7 +1121,7 @@ class Handler(BaseHTTPRequestHandler):
                 "reason": RESET_REASONS.get(code, "unknown"), "state": t["state"]}
 
     def do_POST(self):
-        if not self._origin_ok():
+        if self.read_only or not self._origin_ok():
             self.send_response(403)
             self.end_headers()
             return
@@ -1193,9 +1215,15 @@ if __name__ == "__main__":
     parser.add_argument("--ingest-port", type=int, default=9877)
     parser.add_argument("--frame-port", type=int, default=9878)
     parser.add_argument("--web-port", type=int, default=8080)
+    parser.add_argument("--allow-host", action="append", default=[], metavar="HOSTNAME",
+                        help="extra hostname the dashboard may be reached by (e.g. your nginx/tunnel domain); repeatable")
+    parser.add_argument("--read-only", action="store_true",
+                        help="view-only: refuse every control request (use this for any shared/public tunnel)")
     args = parser.parse_args()
     Handler.qnx_ip = args.qnx_ip
     Handler.web_port = args.web_port
+    Handler.allowed_hosts = {"localhost", "127.0.0.1"} | {h.lower() for h in args.allow_host}
+    Handler.read_only = args.read_only
     Handler.telemetry_port = args.qnx_port
     Handler.ingest_port = args.ingest_port
     Handler.frame_client = FrameClient(args.qnx_ip, args.frame_port)
