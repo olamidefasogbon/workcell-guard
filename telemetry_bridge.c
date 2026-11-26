@@ -7,6 +7,7 @@
 #include <netinet/tcp.h>
 #include <pthread.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -176,6 +177,9 @@ int main(int argc, char **argv) {
 
     if (config_load(cfg_path, &cfg) != 0) return EXIT_FAILURE;
     acl_warn_if_open(&cfg, "telemetry_bridge");
+
+    // A peer that disconnects mid-transfer must produce an error from send()/recv(), not kill this process.
+    signal(SIGPIPE, SIG_IGN);
 
     struct sched_param sp;
     memset(&sp, 0, sizeof(sp));
