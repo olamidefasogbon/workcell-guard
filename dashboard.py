@@ -8,14 +8,59 @@ import socket
 import struct
 import subprocess
 import tempfile
+import sys
 import threading
+import time
+from pathlib import Path
 from urllib.parse import unquote
 
-PKT_FMT = "<IiiiIIIQQfHHHHHH I 8f 8f"
+# v2 telemetry: original fields + fault/reset/heartbeat/camera fields (must match telemetry_bridge.c)
+PKT_FMT = "<IiiiIIIQQfHHHHHH I 8f 8f i i i I I I I I i"
 PKT_SIZE = struct.calcsize(PKT_FMT)
 TELEMETRY_MAGIC = 0x514E5838
 FRAME_MAGIC = 0x46524D38
 CAM_INGEST_MAGIC = 0x43414D38
+MAX_UPLOAD_BYTES = 200 * 1024 * 1024
+FRAME_MAX_AGE_S = 2.0
+
+RESET_REASONS = {
+    0: "accepted",
+    1: "no fresh vision heartbeat",
+    2: "hazard still present in the zone",
+    3: "scene not clear long enough / background baseline still settling",
+    4: "zone polygon invalid",
+}
+
+
+def poll_telemetry(ip, port, timeout=0.25):
+    """One status poll. Returns a dict, or None if the node did not answer with a valid packet.
+    The UI must treat None as 'state unknown, assume stopped' - never as 'unchanged'."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+    try:
+        sock.sendto(b"POLL", (ip, port))
+        data, _ = sock.recvfrom(4096)
+    except OSError:
+        return None
+    finally:
+        sock.close()
+    if len(data) < PKT_SIZE:
+        return None
+    f = struct.unpack(PKT_FMT, data[:PKT_SIZE])
+    if f[0] != TELEMETRY_MAGIC:
+        return None
+    npts = f[16]
+    return {
+        "ok": True,
+        "state": f[1], "latched": f[2], "latch_enabled": f[3], "trip_count": f[4], "ossd_mv": f[5],
+        "frame_id": f[6], "latency_us": f[7], "last_trip_us": f[8], "dist_px": f[9],
+        "bbox": list(f[10:14]), "frame_w": f[14], "frame_h": f[15],
+        "pts": [{"x": f[17 + i], "y": f[25 + i]} for i in range(min(npts, 8))],
+        "fault_reason": f[33], "reset_ready": f[34], "last_reset_result": f[35],
+        "reset_refusals": f[36], "clear_streak": f[37], "stream_epoch": f[38],
+        "heartbeat_age_ms": f[39], "cam_age_ms": f[40], "test_hooks": f[41],
+    }
+
 
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="en">
@@ -531,9 +576,14 @@ async function resetGate() {
   if (actionInFlight) return;
   actionInFlight = true;
   try {
-    await fetch('/api/reset', { method: 'POST' });
+    const res = await fetch('/api/reset', { method: 'POST' });
+    const out = await res.json();
     await pollTelemetry();
-    pushLog('OK', 'DEVCTL', 'DCMD_SAFETY_RESET -> Interlock cleared, OSSD 24.0V DC re-energized');
+    if (out.accepted) {
+      pushLog('OK', 'DEVCTL', 'DCMD_SAFETY_RESET accepted -> OSSD 24.0V DC re-energized (SAFE_RUN)');
+    } else {
+      pushLog('DANGER', 'DEVCTL', 'RESET REFUSED: ' + (out.reason || 'unknown') + ' -> OSSD stays 0V');
+    }
   } finally {
     actionInFlight = false;
   }
@@ -543,6 +593,10 @@ async function toggleLatch() {
   if (actionInFlight) return;
   actionInFlight = true;
   try {
+    if (!(telem && telem.test_hooks)) {
+      pushLog('WARN', 'DEVCTL', 'Latch mode is locked ON (ISO 13849-1 restart interlock); it can only be changed in a test-hooks build');
+      return;
+    }
     const cur = (telem && typeof telem.latch_enabled === 'number') ? telem.latch_enabled : latchStateLocal;
     const next = cur ? 0 : 1;
     latchStateLocal = next;
@@ -607,17 +661,35 @@ async function useSynthetic() {
   pushLog('WARN', 'CAM_FEED', 'Switched /dev/shmem/workcell_cam back to synthetic workcell stream');
 }
 
+const FAULT_NAMES = {
+  0: 'none', 1: 'power-up interlock (reset required)', 2: 'intrusion', 3: 'vision heartbeat lost',
+  4: 'stale camera frame', 5: 'invalid vision report', 6: 'invalid zone polygon', 7: 'vision/gate zone mismatch'
+};
+const RESET_REASON = {
+  0: 'ok', 1: 'no fresh vision heartbeat', 2: 'hazard still present', 3: 'settling (scene must stay clear)', 4: 'invalid zone'
+};
+
+// Telemetry is gone: never keep showing the last good "24 V / running". Unknown means STOPPED.
+function showLinkLost() {
+  telem = null;
+  if (connected) {
+    connected = false;
+    pushLog('DANGER', 'LINK', 'Telemetry lost - machine state UNKNOWN, assume STOPPED (the gate fails safe independently of this UI)');
+  }
+  document.getElementById('stateBadge').className = 'status-pill WATCHDOG_FAULT';
+  document.getElementById('stateText').innerText = 'COMMS LOST — STATE UNKNOWN';
+  const o = document.getElementById('mOssd'); o.innerText = '-- V'; o.style.color = 'var(--danger)';
+  document.getElementById('mBrake').innerText = 'Link lost — assume brake ENGAGED';
+  const r = document.getElementById('rOssd'); r.innerText = '-- / --'; r.style.color = 'var(--danger)';
+  document.getElementById('rRpm').innerText = 'UNKNOWN';
+  document.getElementById('pressMode').innerText = 'LINK LOST';
+}
+
 async function pollTelemetry() {
   try {
     const res = await fetch('/api/telemetry');
     const d = await res.json();
-    if (!d.ok) {
-      if (connected) {
-        connected = false;
-        pushLog('DANGER', 'LINK', 'Lost UDP telemetry connection to QNX node');
-      }
-      return;
-    }
+    if (!d.ok) { showLinkLost(); return; }
     telem = d;
     if (!connected) {
       connected = true;
@@ -636,7 +708,7 @@ async function pollTelemetry() {
       isProx ? 'WARN_SLS' : 'SAFE_RUN'
     );
     document.getElementById('stateText').innerText =
-      d.state === 2 ? 'WATCHDOG_FAULT — RELAY CUTOFF' :
+      d.state === 2 ? ('FAULT — RELAY CUTOFF (' + (FAULT_NAMES[d.fault_reason] || 'unknown') + ')') :
       d.state === 1 ? (d.latched ? 'INTRUSION_HALT — LATCHED E-STOP' : 'INTRUSION_HALT — E-STOP') :
       isProx ? 'PROXIMITY — SLS THROTTLED' : 'SAFE_RUN — CURTAIN CLEAR';
 
@@ -650,13 +722,13 @@ async function pollTelemetry() {
     document.getElementById('mTripLat').innerText = d.last_trip_us > 0 ? `Last E-Stop trip: ${d.last_trip_us} us` : 'Last E-Stop trip: none';
     document.getElementById('mDist').innerText = d.dist_px >= 900 ? 'Clear' : d.dist_px.toFixed(1) + ' px';
     document.getElementById('mFrame').innerText = '#' + d.frame_id;
-    document.getElementById('mTrips').innerText = 'Safety trips: ' + d.trip_count;
+    document.getElementById('mTrips').innerText = 'Safety trips: ' + d.trip_count + (d.cam_age_ms > 500 ? ' | CAMERA STALLED ' + d.cam_age_ms + ' ms' : '');
 
     document.getElementById('rOssd').innerText = d.ossd_mv > 0 ? '24.0V / 24.0V' : '0.0V / 0.0V';
     document.getElementById('rOssd').style.color = d.ossd_mv > 0 ? 'var(--ok)' : 'var(--danger)';
     document.getElementById('rRpm').innerText = d.ossd_mv === 0 ? '0 SPM (HALT)' : (isProx ? '30 SPM (SLS)' : '120 SPM');
     document.getElementById('rRpm').style.color = d.ossd_mv === 0 ? 'var(--danger)' : (isProx ? 'var(--warn)' : 'var(--ok)');
-    document.getElementById('rLatch').innerText = d.latch_enabled ? (d.latched ? 'TRIPPED (LOCKED)' : 'ARMED (ON)') : 'AUTO-RESET (OFF)';
+    document.getElementById('rLatch').innerText = d.latch_enabled ? (d.latched ? (d.reset_ready ? 'TRIPPED — RESET READY' : 'TRIPPED — ' + (RESET_REASON[d.last_reset_result] || 'wait') + ' (' + d.clear_streak + ' clear)') : 'ARMED (ON)') : 'AUTO-RESET (TEST BUILD)';
     document.getElementById('latchBtn').innerText = 'Latch Mode: ' + (d.latch_enabled ? 'ON' : 'OFF');
     document.getElementById('pressMode').innerText = d.ossd_mv === 0 ? 'BRAKE LOCKED' : (isProx ? 'SLS 25% SPEED' : 'NOMINAL 100%');
 
@@ -668,7 +740,7 @@ async function pollTelemetry() {
       lastHeartbeatMs = nowMs;
 
       if (d.state === 2) {
-        pushLog('DANGER', 'WATCHDOG', `HEARTBEAT LOST (>150ms) -> /dev/safety_gate dropped OSSD 24V->0V & locked press brake`);
+        pushLog('DANGER', 'FAULT', `${FAULT_NAMES[d.fault_reason] || 'fault'} -> /dev/safety_gate OSSD 0V & press brake locked`);
       } else if (d.state === 1) {
         pushLog('DANGER', 'E-STOP', `INTRUSION at Frame #${d.frame_id} | Clearance: 0.0 px | IPC: ${d.latency_us} us -> OSSD 0V CUTOFF`);
       } else if (isProx) {
@@ -678,7 +750,7 @@ async function pollTelemetry() {
         pushLog('OK', 'OK', `Curtain clear (${clr}) | OSSD 24.0V DC | Press 120 SPM | IPC ${d.latency_us} us`);
       }
     }
-  } catch (e) {}
+  } catch (e) { showLinkLost(); }
 }
 
 async function pollFrame() {
@@ -714,7 +786,7 @@ function renderLoop() {
     ctx.drawImage(latestFrameImg, 0, 0, W, H);
   }
 
-  const st = telem ? telem.state : 0;
+  const st = telem ? telem.state : 2;
   const isProx = (telem && st === 0 && telem.bbox[2] > 0 && telem.dist_px <= WARN_CLEARANCE_PX);
   const zoneColor = (st === 1 || st === 2) ? '#ef4444' : (isProx ? '#f59e0b' : '#10b981');
   const zoneFill  = (st === 1 || st === 2) ? 'rgba(239, 68, 68, 0.22)' : (isProx ? 'rgba(245, 158, 11, 0.14)' : 'rgba(16, 185, 129, 0.08)');
@@ -858,8 +930,10 @@ requestAnimationFrame(renderLoop);
 
 async function startSimFeed() {
   await fetch('/api/use-synthetic', { method: 'POST' });
-  await fetch('/api/reset', { method: 'POST' });
-  pushLog('OK', 'CAM_FEED', 'Started synthetic workcell simulation');
+  pushLog('OK', 'CAM_FEED', 'Started synthetic workcell simulation - waiting for the background baseline, then requesting reset');
+  // The gate refuses a reset until the baseline has settled and the scene has stayed clear; wait for that.
+  await new Promise(r => setTimeout(r, 1600));
+  await resetGate();
 }
 
 async function loadSampleRealVideo() {
@@ -885,6 +959,7 @@ class FrameClient:
         self.sock = None
         self.lock = threading.Lock()
         self.last_frame = None
+        self.last_frame_t = 0.0
 
     def get_frame(self):
         with self.lock:
@@ -899,13 +974,17 @@ class FrameClient:
                     raise RuntimeError("Bad frame header")
                 px = self._recv_exact(w * h)
                 self.last_frame = (w, h, fid, base64.b64encode(px).decode("ascii"))
-            except Exception:
+                self.last_frame_t = time.monotonic()
+            except (OSError, ConnectionError, RuntimeError, struct.error):
                 if self.sock:
                     try:
                         self.sock.close()
-                    except Exception:
+                    except OSError:
                         pass
                     self.sock = None
+            # A frozen picture must never look live: expire old frames.
+            if self.last_frame and time.monotonic() - self.last_frame_t > FRAME_MAX_AGE_S:
+                self.last_frame = None
             return self.last_frame
 
     def _recv_exact(self, n):
@@ -995,43 +1074,43 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._json({"ok": False})
         elif self.path == "/api/telemetry":
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.settimeout(0.25)
-            try:
-                sock.sendto(b"POLL", (self.qnx_ip, self.telemetry_port))
-                data, _ = sock.recvfrom(4096)
-                if len(data) >= PKT_SIZE:
-                    fields = struct.unpack(PKT_FMT, data[:PKT_SIZE])
-                    if fields[0] == TELEMETRY_MAGIC:
-                        npts = fields[16]
-                        vx = fields[17:25]
-                        vy = fields[25:33]
-                        pts = [{"x": vx[i], "y": vy[i]} for i in range(min(npts, 8))]
-                        self._json({
-                            "ok": True,
-                            "state": fields[1],
-                            "latched": fields[2],
-                            "latch_enabled": fields[3],
-                            "trip_count": fields[4],
-                            "ossd_mv": fields[5],
-                            "frame_id": fields[6],
-                            "latency_us": fields[7],
-                            "last_trip_us": fields[8],
-                            "dist_px": fields[9],
-                            "bbox": list(fields[10:14]),
-                            "frame_w": fields[14],
-                            "frame_h": fields[15],
-                            "pts": pts,
-                        })
-                        return
-            except Exception:
-                pass
-            finally:
-                sock.close()
-            self._json({"ok": False})
+            t = poll_telemetry(self.qnx_ip, self.telemetry_port)
+            self._json(t if t else {"ok": False, "error": "no telemetry from QNX node"})
+
+    web_port = 8080
+
+    def _origin_ok(self):
+        # Blocks cross-site requests (a web page in this browser POSTing /api/reset) and DNS rebinding.
+        hosts = (f"localhost:{self.web_port}", f"127.0.0.1:{self.web_port}")
+        if self.headers.get("Host", "") not in hosts:
+            return False
+        origin = self.headers.get("Origin")
+        return origin is None or origin in tuple("http://" + h for h in hosts)
+
+    def _do_reset(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as rs:
+            rs.sendto(b"RESET", (self.qnx_ip, self.telemetry_port))
+        time.sleep(0.15)
+        t = poll_telemetry(self.qnx_ip, self.telemetry_port)
+        if not t:
+            return {"ok": False, "accepted": False, "reason": "no telemetry - reset result unknown, assume stopped"}
+        code = t["last_reset_result"]
+        return {"ok": True, "accepted": code == 0 and t["state"] == 0,
+                "reason": RESET_REASONS.get(code, "unknown"), "state": t["state"]}
 
     def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
+        if not self._origin_ok():
+            self.send_response(403)
+            self.end_headers()
+            return
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            length = -1
+        if length < 0 or length > MAX_UPLOAD_BYTES:
+            self.send_response(413)
+            self.end_headers()
+            return
         raw = self.rfile.read(length) if length else b""
 
         if self.path == "/api/upload-video":
@@ -1040,7 +1119,7 @@ class Handler(BaseHTTPRequestHandler):
                 w, h, nframes, blob = decode_video_to_gray_frames(raw, fname)
                 push_frames_to_qnx(self.qnx_ip, self.ingest_port, w, h, nframes, blob)
                 self._json({"ok": True, "frames": nframes})
-            except Exception as exc:
+            except (OSError, RuntimeError, ValueError, struct.error) as exc:
                 self._json({"ok": False, "error": str(exc)})
             return
 
@@ -1059,7 +1138,7 @@ class Handler(BaseHTTPRequestHandler):
                 w, h, nframes, blob = decode_video_to_gray_frames(chosen.read_bytes(), chosen.name)
                 push_frames_to_qnx(self.qnx_ip, self.ingest_port, w, h, nframes, blob)
                 self._json({"ok": True, "filename": chosen.name, "frames": nframes})
-            except Exception as exc:
+            except (OSError, RuntimeError, ValueError, struct.error) as exc:
                 self._json({"ok": False, "error": str(exc)})
             return
 
@@ -1067,20 +1146,26 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 push_frames_to_qnx(self.qnx_ip, self.ingest_port, 320, 240, 0, b"")
                 self._json({"ok": True})
-            except Exception as exc:
+            except (OSError, RuntimeError) as exc:
                 self._json({"ok": False, "error": str(exc)})
+            return
+
+        if self.path == "/api/reset":
+            self._json(self._do_reset())
             return
 
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             if self.path == "/api/zone":
-                data = json.loads(raw.decode("utf-8"))
-                pts = data.get("pts", [])
+                try:
+                    pts = json.loads(raw.decode("utf-8")).get("pts", [])
+                    coords = " ".join(f"{float(p['x']):.4f} {float(p['y']):.4f}" for p in pts)
+                except (ValueError, KeyError, TypeError, AttributeError):
+                    self._json({"ok": False, "error": "malformed polygon"})
+                    return
                 if 3 <= len(pts) <= 8:
-                    coords = " ".join(f"{p['x']:.4f} {p['y']:.4f}" for p in pts)
+                    # The gate is the authority: it rejects (and stops the machine on) an invalid polygon.
                     sock.sendto(f"ZONE {len(pts)} {coords}".encode(), (self.qnx_ip, self.telemetry_port))
-            elif self.path == "/api/reset":
-                sock.sendto(b"RESET", (self.qnx_ip, self.telemetry_port))
             elif self.path == "/api/latch":
                 data = json.loads(raw.decode("utf-8"))
                 val = 1 if data.get("enabled") else 0
@@ -1099,7 +1184,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
         except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
-            pass
+            return  # browser went away; nothing to do (the gate never depends on this UI)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -1110,6 +1195,7 @@ if __name__ == "__main__":
     parser.add_argument("--web-port", type=int, default=8080)
     args = parser.parse_args()
     Handler.qnx_ip = args.qnx_ip
+    Handler.web_port = args.web_port
     Handler.telemetry_port = args.qnx_port
     Handler.ingest_port = args.ingest_port
     Handler.frame_client = FrameClient(args.qnx_ip, args.frame_port)

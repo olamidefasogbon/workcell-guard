@@ -1,0 +1,204 @@
+// Unit tests for the portable vision core (vision_core.h) using synthetic frames.
+#include "check.h"
+#include "vision_core.h"
+
+static vision_params_t params(void) {
+    vision_params_t p = { .diff_threshold = 38, .cutoff_margin_px = 15, .freeze_margin_px = 30,
+                          .zone_adapt_rate = 0.002f, .cell_hit_min = 34, .min_blob_cells = 4, .warmup_frames = 20 };
+    return p;
+}
+
+static safety_zone_t right_zone(void) {   // x 50..92 %, y 20..85 %
+    safety_zone_t z = { .num_pts = 4 };
+    z.vx[0]=0.50f; z.vy[0]=0.20f; z.vx[1]=0.92f; z.vy[1]=0.20f; z.vx[2]=0.92f; z.vy[2]=0.85f; z.vx[3]=0.50f; z.vy[3]=0.85f;
+    return z;
+}
+
+static void scene(uint8_t *f, uint32_t w, uint32_t h, int bright) {
+    for (uint32_t y = 0; y < h; y++)
+        for (uint32_t x = 0; x < w; x++)
+            f[y * w + x] = (uint8_t)((bright ? 120 : 28) + (y * 18) / h + (((x / 32) + (y / 32)) & 1 ? 6 : 0));
+}
+
+static void box(uint8_t *f, uint32_t w, uint32_t h, int x0, int y0, int x1, int y1, uint8_t v) {
+    for (int y = y0; y <= y1; y++)
+        for (int x = x0; x <= x1; x++)
+            if (x >= 0 && y >= 0 && x < (int)w && y < (int)h) f[(uint32_t)y * w + (uint32_t)x] = v;
+}
+
+static vision_result_t run(vision_ctx_t *c, const uint8_t *f, uint32_t w, uint32_t h, uint32_t epoch, const safety_zone_t *z) {
+    vision_params_t p = params();
+    vision_result_t r;
+    int rc = vision_process(c, f, w, h, epoch, z, &p, &r);
+    CHECK(rc == 0, "vision_process rc=%d", rc);
+    return r;
+}
+
+static void settle(vision_ctx_t *c, uint8_t *f, uint32_t w, uint32_t h, const safety_zone_t *z, int n) {
+    for (int i = 0; i < n; i++) run(c, f, w, h, 1, z);
+}
+
+#define W 320
+#define H 240
+static uint8_t frame[W * H];
+
+static void test_empty_scene_and_warmup(void) {
+    TEST("empty scene: no detections; baseline becomes valid exactly after warmup");
+    vision_ctx_t *c = vision_create(); safety_zone_t z = right_zone();
+    scene(frame, W, H, 0);
+    vision_result_t r = run(c, frame, W, H, 1, &z);
+    CHECK(r.reseeded && !r.intrusion && r.blob_count == 0 && !r.baseline_valid, "first frame seeds, baseline not valid yet");
+    for (int i = 2; i <= 19; i++) { r = run(c, frame, W, H, 1, &z); CHECK(!r.baseline_valid, "frame %d: still warming up", i); }
+    r = run(c, frame, W, H, 1, &z);
+    CHECK(r.baseline_valid && !r.intrusion && r.dist_px >= 900.0f, "valid after 20 frames, nothing detected");
+    vision_destroy(c);
+}
+
+static void test_intruder_detected_and_never_absorbed(void) {
+    TEST("a person who walks into the zone and STOPS is never learned into the background");
+    vision_ctx_t *c = vision_create(); safety_zone_t z = right_zone();
+    scene(frame, W, H, 0); settle(c, frame, W, H, &z, 30);
+
+    int first_hit = -1;
+    for (int x = 20; x <= 220; x += 4) {        // walks in from the left, ends inside the zone
+        scene(frame, W, H, 0); box(frame, W, H, x, 90, x + 24, 150, 225);
+        vision_result_t r = run(c, frame, W, H, 1, &z);
+        if (r.intrusion && first_hit < 0) first_hit = x;
+    }
+    CHECK(first_hit > 0 && first_hit < 200, "intrusion raised while walking in (at x=%d)", first_hit);
+
+    int missed = 0;
+    for (int i = 0; i < 1800; i++) {            // stands perfectly still for 60 s @30 fps
+        scene(frame, W, H, 0); box(frame, W, H, 220, 90, 244, 150, 225);
+        vision_result_t r = run(c, frame, W, H, 1, &z);
+        if (!r.intrusion) missed++;
+    }
+    CHECK(missed == 0, "stationary intruder must stay detected for the whole minute (missed %d frames)", missed);
+
+    scene(frame, W, H, 0);                      // leaves
+    vision_result_t r = run(c, frame, W, H, 1, &z);
+    CHECK(!r.intrusion, "clears immediately once the person is gone (no ghost trail in the zone)");
+    vision_destroy(c);
+}
+
+static void test_warning_distance(void) {
+    TEST("clearance is reported accurately and the cutoff margin trips before contact");
+    vision_ctx_t *c = vision_create(); safety_zone_t z = right_zone();
+    scene(frame, W, H, 0); settle(c, frame, W, H, &z, 30);
+    // zone left edge is x=160. A 24px-wide box ending at x=160-D has clearance ~D.
+    scene(frame, W, H, 0); box(frame, W, H, 100, 90, 135, 150, 225);   // right edge 135 -> clearance ~25
+    vision_result_t r = run(c, frame, W, H, 1, &z);
+    CHECK(!r.intrusion && r.dist_px > 15.0f && r.dist_px < 45.0f, "25px away: warn range, not cut off (dist %.1f)", r.dist_px);
+    scene(frame, W, H, 0); box(frame, W, H, 100, 90, 148, 150, 225);   // clearance ~12 < 15 margin
+    r = run(c, frame, W, H, 1, &z);
+    CHECK(r.intrusion, "inside the 15px cutoff margin trips (dist %.1f)", r.dist_px);
+    vision_destroy(c);
+}
+
+static void test_every_blob_is_checked(void) {
+    TEST("a small intruder in the zone is detected even when a bigger object is elsewhere");
+    vision_ctx_t *c = vision_create(); safety_zone_t z = right_zone();
+    scene(frame, W, H, 0); settle(c, frame, W, H, &z, 30);
+    scene(frame, W, H, 0);
+    box(frame, W, H, 10, 40, 80, 200, 225);        // big blob far from the zone (70x160)
+    box(frame, W, H, 200, 100, 223, 123, 225);     // small blob inside the zone (24x24)
+    vision_result_t r = run(c, frame, W, H, 1, &z);
+    CHECK(r.blob_count == 2, "both blobs seen (%u)", r.blob_count);
+    CHECK(r.intrusion && r.bbox_x >= 190, "intrusion reported for the blob INSIDE the zone (bbox x=%u)", r.bbox_x);
+    vision_destroy(c);
+}
+
+static void test_no_blind_border(void) {
+    TEST("intruder touching the frame border is detected (old code ignored a 6-16 px border band)");
+    vision_ctx_t *c = vision_create();
+    safety_zone_t z = { .num_pts = 4 };
+    z.vx[0]=0.90f; z.vy[0]=0.20f; z.vx[1]=0.99f; z.vy[1]=0.20f; z.vx[2]=0.99f; z.vy[2]=0.85f; z.vx[3]=0.90f; z.vy[3]=0.85f;
+    scene(frame, W, H, 0); settle(c, frame, W, H, &z, 30);
+    scene(frame, W, H, 0); box(frame, W, H, 300, 90, W - 1, 150, 225);
+    vision_result_t r = run(c, frame, W, H, 1, &z);
+    CHECK(r.intrusion, "border-hugging intruder detected");
+    vision_destroy(c);
+}
+
+static void test_large_frame_full_coverage(void) {
+    TEST("frames wider than 512 px are fully monitored (old code only looked at the top-left 512x512)");
+    static uint8_t big[800 * 600];
+    vision_ctx_t *c = vision_create();
+    safety_zone_t z = { .num_pts = 4 };
+    z.vx[0]=0.70f; z.vy[0]=0.40f; z.vx[1]=0.95f; z.vy[1]=0.40f; z.vx[2]=0.95f; z.vy[2]=0.90f; z.vx[3]=0.70f; z.vy[3]=0.90f;
+    scene(big, 800, 600, 0); for (int i = 0; i < 30; i++) run(c, big, 800, 600, 1, &z);
+    scene(big, 800, 600, 0); box(big, 800, 600, 620, 300, 680, 420, 225);   // x>512 AND y>512-ish region
+    vision_result_t r = run(c, big, 800, 600, 1, &z);
+    CHECK(r.intrusion, "intruder at x=620..680 in an 800x600 frame detected");
+    vision_destroy(c);
+}
+
+static void test_stream_swap_epoch(void) {
+    TEST("stream swap: epoch bump re-seeds cleanly (no false trip); without it the stale background would trip");
+    vision_ctx_t *c = vision_create(); safety_zone_t z = right_zone();
+    scene(frame, W, H, 0); settle(c, frame, W, H, &z, 40);
+
+    scene(frame, W, H, 1);                                    // bright real-video-like scene
+    vision_result_t r = run(c, frame, W, H, 2, &z);           // epoch 1 -> 2
+    CHECK(r.reseeded && !r.intrusion && r.blob_count == 0, "no false intrusion on swap");
+    CHECK(!r.baseline_valid, "baseline not valid right after a swap -> reset stays blocked");
+    for (int i = 0; i < 25; i++) r = run(c, frame, W, H, 2, &z);
+    CHECK(r.baseline_valid && !r.intrusion, "baseline valid after warmup");
+
+    vision_ctx_t *c2 = vision_create();                       // control: same swap but forgetting the epoch bump
+    scene(frame, W, H, 0); settle(c2, frame, W, H, &z, 40);
+    scene(frame, W, H, 1);
+    r = run(c2, frame, W, H, 1, &z);
+    CHECK(r.intrusion, "control: stale background on an un-signalled swap DOES trip (fail-safe, not silent)");
+    vision_destroy(c); vision_destroy(c2);
+}
+
+static void test_frame_size_change_reseeds(void) {
+    TEST("frame size change re-seeds");
+    vision_ctx_t *c = vision_create(); safety_zone_t z = right_zone();
+    scene(frame, W, H, 0); settle(c, frame, W, H, &z, 25);
+    static uint8_t small[160 * 120];
+    scene(small, 160, 120, 0);
+    vision_result_t r = run(c, small, 160, 120, 1, &z);
+    CHECK(r.reseeded && !r.intrusion, "size change reseeds without a false trip");
+    vision_destroy(c);
+}
+
+static void test_outside_object_no_ghost_in_zone(void) {
+    TEST("an object parked outside the zone for a long time then removed does not cause a false trip");
+    vision_ctx_t *c = vision_create(); safety_zone_t z = right_zone();
+    scene(frame, W, H, 0); settle(c, frame, W, H, &z, 30);
+    for (int i = 0; i < 600; i++) { scene(frame, W, H, 0); box(frame, W, H, 20, 90, 60, 150, 225); run(c, frame, W, H, 1, &z); }
+    scene(frame, W, H, 0);
+    int trips = 0;
+    for (int i = 0; i < 100; i++) { vision_result_t r = run(c, frame, W, H, 1, &z); if (r.intrusion) trips++; }
+    CHECK(trips == 0, "no false intrusion from a removed far-away object (%d)", trips);
+    vision_destroy(c);
+}
+
+static void test_bad_arguments(void) {
+    TEST("invalid arguments are rejected, not processed");
+    vision_ctx_t *c = vision_create(); safety_zone_t z = right_zone(); vision_params_t p = params(); vision_result_t r;
+    scene(frame, W, H, 0);
+    CHECK(vision_process(c, frame, 8, 8, 1, &z, &p, &r) == -2, "tiny frame");
+    CHECK(vision_process(c, frame, 1300, 100, 1, &z, &p, &r) == -2, "oversized dimension");
+    safety_zone_t bad = z; bad.num_pts = 2;
+    CHECK(vision_process(c, frame, W, H, 1, &bad, &p, &r) == -2, "bad zone");
+    CHECK(vision_process(NULL, frame, W, H, 1, &z, &p, &r) == -2, "null ctx");
+    vision_destroy(c);
+}
+
+int main(void) {
+    printf("test_vision\n");
+    test_empty_scene_and_warmup();
+    test_intruder_detected_and_never_absorbed();
+    test_warning_distance();
+    test_every_blob_is_checked();
+    test_no_blind_border();
+    test_large_frame_full_coverage();
+    test_stream_swap_epoch();
+    test_frame_size_change_reseeds();
+    test_outside_object_no_ghost_in_zone();
+    test_bad_arguments();
+    return check_summary("test_vision");
+}
