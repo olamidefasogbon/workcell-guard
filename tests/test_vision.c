@@ -109,6 +109,27 @@ static void test_every_blob_is_checked(void) {
     vision_destroy(c);
 }
 
+static void test_arm_is_judged_by_its_hand(void) {
+    TEST("an arm reaching in from the edge: box follows the hand, clearance is the hand's, L-shapes do not false-trip");
+    vision_ctx_t *c = vision_create(); safety_zone_t z = right_zone();
+    scene(frame, W, H, 0); settle(c, frame, W, H, &z, 40);
+    // arm from the left edge to x=135 (zone starts at x=160): hand clearance ~25
+    scene(frame, W, H, 0); box(frame, W, H, 0, 90, 135, 120, 225);
+    vision_result_t r = run(c, frame, W, H, 1, &z);
+    CHECK(!r.intrusion && r.dist_px > 15.0f && r.dist_px < 45.0f, "arm tip 25px away: warning, not cut off (dist %.1f)", r.dist_px);
+    CHECK(r.bbox_x + r.bbox_w >= 130 && r.bbox_x + r.bbox_w <= 140, "box ends at the hand (right edge %u)", r.bbox_x + r.bbox_w);
+    CHECK(r.bbox_w < 90, "box is the hand/forearm, not the whole arm (width %u of 136)", r.bbox_w);
+    // hand enters the zone: still tripped
+    scene(frame, W, H, 0); box(frame, W, H, 0, 90, 175, 120, 225);
+    r = run(c, frame, W, H, 1, &z);
+    CHECK(r.intrusion, "hand inside the zone trips");
+    // L-shaped blob wrapping around the zone at a safe distance: its bounding rectangle covers the zone, its pixels do not
+    scene(frame, W, H, 0); box(frame, W, H, 20, 0, 40, 239, 225); box(frame, W, H, 20, 224, 319, 239, 225);
+    r = run(c, frame, W, H, 1, &z);
+    CHECK(!r.intrusion && r.dist_px > 15.0f, "L-shape around the zone is not a false stop (dist %.1f)", r.dist_px);
+    vision_destroy(c);
+}
+
 static void test_no_blind_border(void) {
     TEST("intruder touching the frame border is detected (old code ignored a 6-16 px border band)");
     vision_ctx_t *c = vision_create();
@@ -265,6 +286,7 @@ int main(void) {
     test_intruder_detected_and_never_absorbed();
     test_warning_distance();
     test_every_blob_is_checked();
+    test_arm_is_judged_by_its_hand();
     test_no_blind_border();
     test_large_frame_full_coverage();
     test_stream_swap_epoch();

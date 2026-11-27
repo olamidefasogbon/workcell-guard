@@ -24,7 +24,8 @@
 #include "safety_protocol.h"
 
 #define VC_CELL     8U
-#define VC_QUIET_PX 16U   // at most this many foreground pixels in the zone region still counts as "quiet"
+#define VC_TIP_PX   56.0f // reported box covers the blob within this distance of its closest-to-zone cell (a hand, not a whole arm)
+#define VC_QUIET_PX 16U  // at most this many foreground pixels in the zone region still counts as "quiet"
 #define VC_MAX_COLS (MAX_FRAME_DIM / VC_CELL)
 #define VC_MAX_ROWS (MAX_FRAME_DIM / VC_CELL)
 
@@ -317,25 +318,46 @@ static inline int vision_process(vision_ctx_t *c, const uint8_t *frame, uint32_t
             if (tail < p->min_blob_cells) continue;
             blobs++;
 
-            // Tighten the box to the actual foreground pixels (against the un-updated background).
-            uint32_t tx0 = cmax_x, ty0 = cmax_y, tx1 = cmin_x, ty1 = cmin_y;
-            for (uint32_t yy = cmin_y; yy <= cmax_y && yy < h; yy++) {
-                for (uint32_t xx = cmin_x; xx <= cmax_x && xx < w; xx++) {
-                    size_t i = (size_t)yy * w + xx;
-                    if (fabsf((float)c->smooth[i] - c->bg[i]) > p->diff_threshold) {
-                        if (xx < tx0) tx0 = xx;
-                        if (xx > tx1) tx1 = xx;
-                        if (yy < ty0) ty0 = yy;
-                        if (yy > ty1) ty1 = yy;
+            // Distance is measured per CELL of the blob (the real shape), not per bounding rectangle:
+            // an arm reaching in from the edge is judged by its hand, and an L-shaped blob whose
+            // rectangle overlaps the zone but whose pixels do not is no longer a false stop.
+            // Cells are a superset of the detected pixels at 8 px granularity, and cutoff_margin_px
+            // (>= 2 cells) covers the fringe.
+            uint8_t intr = 0;
+            float d = 9999.0f;
+            uint32_t tip = 0;                       // index (in the BFS queue) of the cell closest to the zone
+            for (uint32_t k = 0; k < tail; k++) {
+                float cx0 = (float)(c->qx[k] * VC_CELL), cy0 = (float)(c->qy[k] * VC_CELL);
+                uint8_t ci = 0; float cd = 0.0f;
+                vc_eval_poly_rect(px, py, zone->num_pts, cx0, cy0, cx0 + (float)(VC_CELL - 1), cy0 + (float)(VC_CELL - 1), &ci, &cd);
+                if (ci) { intr = 1; d = 0.0f; tip = k; break; }
+                if (cd < d) { d = cd; tip = k; }
+            }
+            if (!intr && d <= p->cutoff_margin_px) intr = 1;
+
+            // Reported box = the leading tip (the part of the blob nearest the zone, VC_TIP_PX around
+            // the closest cell), tightened to foreground pixels. Display only; it never drives the output.
+            const float tipx = (float)(c->qx[tip] * VC_CELL) + VC_CELL * 0.5f;
+            const float tipy = (float)(c->qy[tip] * VC_CELL) + VC_CELL * 0.5f;
+            uint32_t tx0 = w, ty0 = h, tx1 = 0, ty1 = 0;
+            for (uint32_t k = 0; k < tail; k++) {
+                float ddx_ = (float)(c->qx[k] * VC_CELL) + VC_CELL * 0.5f - tipx;
+                float ddy_ = (float)(c->qy[k] * VC_CELL) + VC_CELL * 0.5f - tipy;
+                if (fabsf(ddx_) > VC_TIP_PX || fabsf(ddy_) > VC_TIP_PX) continue;
+                uint32_t x0 = c->qx[k] * VC_CELL, y0 = c->qy[k] * VC_CELL;
+                for (uint32_t yy = y0; yy < y0 + VC_CELL && yy < h; yy++) {
+                    for (uint32_t xx = x0; xx < x0 + VC_CELL && xx < w; xx++) {
+                        size_t i = (size_t)yy * w + xx;
+                        if (fabsf((float)c->smooth[i] - c->bg[i]) > p->diff_threshold) {
+                            if (xx < tx0) tx0 = xx;
+                            if (xx > tx1) tx1 = xx;
+                            if (yy < ty0) ty0 = yy;
+                            if (yy > ty1) ty1 = yy;
+                        }
                     }
                 }
             }
             if (tx1 < tx0 || ty1 < ty0) { tx0 = cmin_x; ty0 = cmin_y; tx1 = cmax_x; ty1 = cmax_y; }
-
-            uint8_t intr = 0;
-            float d = 999.0f;
-            vc_eval_poly_rect(px, py, zone->num_pts, (float)tx0, (float)ty0, (float)tx1, (float)ty1, &intr, &d);
-            if (!intr && d <= p->cutoff_margin_px) intr = 1;
 
             int better = (intr && !best_intr) || (intr == best_intr && d < best_dist) || blobs == 1;
             if (better) {
