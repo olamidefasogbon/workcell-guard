@@ -11,8 +11,9 @@ import tempfile
 import sys
 import threading
 import time
+import zlib
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 # v2 telemetry: original fields + fault/reset/heartbeat/camera fields (must match telemetry_bridge.c)
 PKT_FMT = "<IiiiIIIQQfHHHHHH I 8f 8f i i i I I I I I i"
@@ -30,6 +31,23 @@ RESET_REASONS = {
     3: "scene not clear long enough / background baseline still settling",
     4: "zone polygon invalid",
 }
+
+FAULT_NAMES = {
+    0: "none", 1: "power-up interlock (reset required)", 2: "intrusion", 3: "vision heartbeat lost",
+    4: "stale camera frame", 5: "invalid vision report", 6: "invalid zone polygon", 7: "vision/gate zone mismatch",
+    8: "learning background (keep the zone clear)",
+}
+
+
+def encode_png_gray(w, h, pixels):
+    """8-bit grayscale PNG from raw pixels (stdlib only). ~10x smaller than raw and decoded natively by the browser."""
+    raw = b"".join(b"\x00" + pixels[y * w:(y + 1) * w] for y in range(h))
+
+    def chunk(tag, data):
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 0, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 1)) + chunk(b"IEND", b""))
 
 
 def poll_telemetry(ip, port, timeout=0.25):
@@ -565,19 +583,21 @@ function presetPoly(kind) {
 }
 
 async function sendPolygonToQnx() {
+  if (READ_ONLY) return;
   await fetch('/api/zone', { method: 'POST', body: JSON.stringify({ pts: polyPts }) });
   pushLog('WARN', 'DEVCTL', `DCMD_SAFETY_SET_ZONE pushed ${polyPts.length}-vertex custom polygon to /dev/safety_gate`);
 }
 
 let latchStateLocal = 1;
+let READ_ONLY = false;
 let actionInFlight = false;
 
 async function resetGate() {
-  if (actionInFlight) return;
+  if (actionInFlight || READ_ONLY) return;
   actionInFlight = true;
   try {
     const res = await fetch('/api/reset', { method: 'POST' });
-    const out = await res.json();
+    const out = await res.json().catch(() => ({ accepted: false, reason: 'request refused' }));
     await pollTelemetry();
     if (out.accepted) {
       pushLog('OK', 'DEVCTL', 'DCMD_SAFETY_RESET accepted -> OSSD 24.0V DC re-energized (SAFE_RUN)');
@@ -645,6 +665,7 @@ async function uploadVideo(file) {
       title.innerText = 'Active: ' + file.name + ' (' + out.frames + ' frames)';
       document.getElementById('mSource').innerText = file.name;
       pushLog('OK', 'CAM_FEED', `Hot-swapped /dev/shmem/workcell_cam -> ${file.name} (${out.frames} frames @ 30 FPS)`);
+      pushLog('WARN', 'DEVCTL', 'Stream changed: the machine stays stopped while the new background is learned. Keep the zone clear, then press Reset.');
     } else {
       title.innerText = 'Upload failed — click to retry';
       pushLog('DANGER', 'INGEST', out.error || 'Video decode error');
@@ -659,11 +680,13 @@ async function useSynthetic() {
   document.getElementById('uploadTitle').innerText = 'Click or drop a test video (.mp4, .mov)';
   document.getElementById('mSource').innerText = 'Synthetic Stream';
   pushLog('WARN', 'CAM_FEED', 'Switched /dev/shmem/workcell_cam back to synthetic workcell stream');
+  pushLog('WARN', 'DEVCTL', 'Stream changed: the machine stays stopped while the new background is learned. Keep the zone clear, then press Reset.');
 }
 
 const FAULT_NAMES = {
   0: 'none', 1: 'power-up interlock (reset required)', 2: 'intrusion', 3: 'vision heartbeat lost',
-  4: 'stale camera frame', 5: 'invalid vision report', 6: 'invalid zone polygon', 7: 'vision/gate zone mismatch'
+  4: 'stale camera frame', 5: 'invalid vision report', 6: 'invalid zone polygon', 7: 'vision/gate zone mismatch',
+  8: 'learning background - keep the zone clear'
 };
 const RESET_REASON = {
   0: 'ok', 1: 'no fresh vision heartbeat', 2: 'hazard still present', 3: 'settling (scene must stay clear)', 4: 'invalid zone'
@@ -765,25 +788,17 @@ async function pollTelemetry() {
   } catch (e) { onTelemetryMiss(); }
 }
 
+let lastFrameFid = -1;
 async function pollFrame() {
   try {
-    const res = await fetch('/api/frame');
+    const res = await fetch('/api/frame?since=' + lastFrameFid);
     const f = await res.json();
-    if (f.ok && f.w > 0 && f.h > 0 && f.pixels_b64) {
-      offCanvas.width = f.w;
-      offCanvas.height = f.h;
-      const raw = atob(f.pixels_b64);
-      const img = offCtx.createImageData(f.w, f.h);
-      for (let i = 0; i < raw.length; i++) {
-        const v = raw.charCodeAt(i);
-        img.data[i * 4] = v;
-        img.data[i * 4 + 1] = v;
-        img.data[i * 4 + 2] = v;
-        img.data[i * 4 + 3] = 255;
-      }
-      offCtx.putImageData(img, 0, 0);
-      latestFrameImg = offCanvas;
-    }
+    if (!f.ok) { latestFrameImg = null; lastFrameFid = -1; return; }   // never leave a frozen picture looking live
+    if (f.unchanged) return;
+    const img = new Image();
+    await new Promise((resolve, reject) => { img.onload = resolve; img.onerror = reject; img.src = 'data:image/png;base64,' + f.png_b64; });
+    latestFrameImg = img;
+    lastFrameFid = f.fid;
   } catch (e) {}
 }
 
@@ -927,27 +942,47 @@ function drawServoPressTwin(st, isProx) {
 }
 
 async function telemetryLoop() {
+  const t0 = performance.now();
   await pollTelemetry();
-  setTimeout(telemetryLoop, 45);
+  setTimeout(telemetryLoop, Math.max(60, performance.now() - t0));   // adapt to the link; never pile up requests
 }
 
 async function frameLoop() {
   const t0 = performance.now();
   await pollFrame();
   const took = performance.now() - t0;
-  setTimeout(frameLoop, Math.max(45, took));   // never poll faster than the link can deliver frames
+  setTimeout(frameLoop, Math.max(80, took));   // never poll faster than the link can deliver frames
 }
 
+fetch('/api/mode').then(r => r.json()).then(m => {
+  if (!m.read_only) return;
+  READ_ONLY = true;
+  document.querySelectorAll('button').forEach(b => { b.disabled = true; b.style.opacity = '0.45'; b.style.cursor = 'not-allowed'; });
+  const tag = document.createElement('div');
+  tag.textContent = 'VIEW ONLY';
+  tag.style.cssText = 'position:fixed;right:12px;bottom:12px;z-index:50;padding:6px 12px;border-radius:6px;background:#1f2937;color:#e5e7eb;font:600 12px monospace;letter-spacing:.08em;border:1px solid #374151';
+  document.body.appendChild(tag);
+}).catch(() => {});
 telemetryLoop();
 frameLoop();
 requestAnimationFrame(renderLoop);
 
 async function startSimFeed() {
   await fetch('/api/use-synthetic', { method: 'POST' });
-  pushLog('OK', 'CAM_FEED', 'Started synthetic workcell simulation - waiting for the background baseline, then requesting reset');
-  // The gate refuses a reset until the baseline has settled and the scene has stayed clear; wait for that.
-  await new Promise(r => setTimeout(r, 1600));
-  await resetGate();
+  pushLog('OK', 'CAM_FEED', 'Started synthetic workcell - the machine stays stopped while the background is learned (keep the zone clear)');
+  // The gate refuses a reset until the background is trusted and the scene has stayed clear; retry until it accepts.
+  let reason = '';
+  for (let i = 0; i < 25; i++) {
+    await new Promise(r => setTimeout(r, 800));
+    try {
+      const res = await fetch('/api/reset', { method: 'POST' });
+      const out = await res.json();
+      if (out.accepted) { await pollTelemetry(); pushLog('OK', 'DEVCTL', 'DCMD_SAFETY_RESET accepted -> OSSD 24.0V DC (SAFE_RUN)'); return; }
+      reason = out.reason || out.error || '';
+      if (res.status === 403) break;
+    } catch (e) { reason = 'no response'; }
+  }
+  pushLog('DANGER', 'DEVCTL', 'Reset still refused: ' + reason + ' -> OSSD stays 0V (press Reset when the zone is clear)');
 }
 
 async function loadSampleRealVideo() {
@@ -956,6 +991,7 @@ async function loadSampleRealVideo() {
   const j = await r.json();
   if (j.ok) {
     pushLog('OK', 'INGEST', `Loaded ${j.filename} (${j.frames} frames) -> /dev/shmem/workcell_cam`);
+    pushLog('WARN', 'DEVCTL', 'Stream changed: the machine stays stopped while the new background is learned. Keep the zone clear, then press Reset.');
   } else {
     pushLog('DANGER', 'INGEST', j.error || 'Failed to load sample video');
   }
@@ -987,7 +1023,7 @@ class FrameClient:
                 if magic != FRAME_MAGIC or w == 0 or h == 0:
                     raise RuntimeError("Bad frame header")
                 px = self._recv_exact(w * h)
-                self.last_frame = (w, h, fid, base64.b64encode(px).decode("ascii"))
+                self.last_frame = (w, h, fid, px)
                 self.last_frame_t = time.monotonic()
             except (OSError, ConnectionError, RuntimeError, struct.error):
                 if self.sock:
@@ -1011,6 +1047,87 @@ class FrameClient:
             chunks.append(part)
             got += len(part)
         return b"".join(chunks)
+
+
+class LiveCache:
+    """Polls the QNX node ONCE (one status stream, one frame stream) and serves every browser from memory.
+
+    Without this, each open browser tab hit the VM with ~22 status polls and ~22 full-frame fetches per second,
+    so a few viewers (or a laggy tunnel with retries) starved the VM and tripped the watchdog. Viewer count no
+    longer changes the load on the safety node; with no viewers it drops to a slow heartbeat poll."""
+    TELEMETRY_PERIOD_S = 0.05
+    TELEMETRY_IDLE_PERIOD_S = 0.5
+    FRAME_PERIOD_S = 0.1
+    IDLE_AFTER_S = 5.0
+    TELEMETRY_MAX_AGE_S = 1.0
+
+    def __init__(self, qnx_ip, telemetry_port, frame_client):
+        self.qnx_ip, self.telemetry_port, self.frame_client = qnx_ip, telemetry_port, frame_client
+        self.lock = threading.Lock()
+        self.telemetry, self.telemetry_t = None, 0.0
+        self.frame, self.frame_t = None, 0.0
+        self.last_viewer = time.monotonic()
+        self.telemetry_polls = 0
+        self._started = False
+
+    def touch(self):
+        self.last_viewer = time.monotonic()
+
+    def _idle(self):
+        return time.monotonic() - self.last_viewer > self.IDLE_AFTER_S
+
+    def start(self):
+        if self._started:
+            return
+        self._started = True
+        threading.Thread(target=self._telemetry_loop, daemon=True).start()
+        threading.Thread(target=self._frame_loop, daemon=True).start()
+
+    def _telemetry_loop(self):
+        while True:
+            t0 = time.monotonic()
+            t = poll_telemetry(self.qnx_ip, self.telemetry_port)
+            self.telemetry_polls += 1
+            if t:
+                with self.lock:
+                    self.telemetry, self.telemetry_t = t, time.monotonic()
+            period = self.TELEMETRY_IDLE_PERIOD_S if self._idle() else self.TELEMETRY_PERIOD_S
+            time.sleep(max(0.005, period - (time.monotonic() - t0)))
+
+    def _frame_loop(self):
+        last_fid = None
+        while True:
+            t0 = time.monotonic()
+            if self._idle():
+                time.sleep(0.25)
+                continue
+            fr = self.frame_client.get_frame()
+            if fr and fr[2] != last_fid:
+                w, h, fid, px = fr
+                png = base64.b64encode(encode_png_gray(w, h, px)).decode("ascii")
+                with self.lock:
+                    self.frame, self.frame_t = {"w": w, "h": h, "fid": fid, "png_b64": png}, time.monotonic()
+                last_fid = fid
+            elif not fr:
+                with self.lock:
+                    self.frame = None
+            time.sleep(max(0.005, self.FRAME_PERIOD_S - (time.monotonic() - t0)))
+
+    def get_telemetry(self):
+        with self.lock:
+            t, age = self.telemetry, time.monotonic() - self.telemetry_t
+        if not t or age > self.TELEMETRY_MAX_AGE_S:
+            return None
+        return dict(t, server_age_ms=int(age * 1000))
+
+    def get_frame(self, since=None):
+        with self.lock:
+            f, age = self.frame, time.monotonic() - self.frame_t
+        if not f or age > FRAME_MAX_AGE_S:
+            return {"ok": False}          # never show a frozen picture as live
+        if since is not None and since == f["fid"]:
+            return {"ok": True, "unchanged": True, "fid": f["fid"]}
+        return dict(f, ok=True)
 
 
 def decode_video_to_gray_frames(raw_bytes, filename, w=320, h=240, max_frames=450):
@@ -1071,6 +1188,7 @@ class Handler(BaseHTTPRequestHandler):
     telemetry_port = 9876
     ingest_port = 9877
     frame_client = None
+    cache = None
 
     def log_message(self, format, *args):
         pass
@@ -1081,15 +1199,23 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
             self.wfile.write(HTML_PAGE.encode("utf-8"))
-        elif self.path == "/api/frame":
-            fr = self.frame_client.get_frame()
-            if fr:
-                self._json({"ok": True, "w": fr[0], "h": fr[1], "fid": fr[2], "pixels_b64": fr[3]})
-            else:
-                self._json({"ok": False})
+        elif self.path.startswith("/api/frame"):
+            self.cache.touch()
+            q = parse_qs(urlparse(self.path).query)
+            try:
+                since = int(q["since"][0]) if "since" in q else None
+            except ValueError:
+                since = None
+            self._json(self.cache.get_frame(since))
         elif self.path == "/api/telemetry":
-            t = poll_telemetry(self.qnx_ip, self.telemetry_port)
+            self.cache.touch()
+            t = self.cache.get_telemetry()
             self._json(t if t else {"ok": False, "error": "no telemetry from QNX node"})
+        elif self.path == "/api/mode":
+            self._json({"read_only": bool(self.read_only)})
+        else:
+            self.send_response(404)
+            self.end_headers()
 
     web_port = 8080
     allowed_hosts = {"localhost", "127.0.0.1"}   # hostnames only (a tunnel changes the port); add more with --allow-host
@@ -1122,8 +1248,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.read_only or not self._origin_ok():
-            self.send_response(403)
-            self.end_headers()
+            self._json({"ok": False, "accepted": False,
+                        "error": "view-only dashboard" if self.read_only else "request origin not allowed",
+                        "reason": "this dashboard is view-only" if self.read_only else "request origin not allowed"}, status=403)
             return
         try:
             length = int(self.headers.get("Content-Length", 0))
@@ -1198,11 +1325,13 @@ class Handler(BaseHTTPRequestHandler):
             sock.close()
         self._json({"ok": True})
 
-    def _json(self, obj):
+    def _json(self, obj, status=200):
         try:
             body = json.dumps(obj).encode("utf-8")
-            self.send_response(200)
+            self.send_response(status)
             self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(body)
         except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
@@ -1217,6 +1346,8 @@ if __name__ == "__main__":
     parser.add_argument("--web-port", type=int, default=8080)
     parser.add_argument("--allow-host", action="append", default=[], metavar="HOSTNAME",
                         help="extra hostname the dashboard may be reached by (e.g. your nginx/tunnel domain); repeatable")
+    parser.add_argument("--bind", default="127.0.0.1",
+                        help="address to listen on (default localhost only; use 0.0.0.0 to share on your LAN, together with --allow-host and --read-only)")
     parser.add_argument("--read-only", action="store_true",
                         help="view-only: refuse every control request (use this for any shared/public tunnel)")
     args = parser.parse_args()
@@ -1227,5 +1358,8 @@ if __name__ == "__main__":
     Handler.telemetry_port = args.qnx_port
     Handler.ingest_port = args.ingest_port
     Handler.frame_client = FrameClient(args.qnx_ip, args.frame_port)
-    print(f"Workcell Guard Control Plane live at http://localhost:{args.web_port} (QNX {args.qnx_ip})")
-    ThreadingHTTPServer(("127.0.0.1", args.web_port), Handler).serve_forever()
+    Handler.cache = LiveCache(args.qnx_ip, args.qnx_port, Handler.frame_client)
+    Handler.cache.start()
+    mode = "VIEW-ONLY" if args.read_only else "control"
+    print(f"Workcell Guard Control Plane ({mode}) live at http://localhost:{args.web_port} (QNX {args.qnx_ip})")
+    ThreadingHTTPServer((args.bind, args.web_port), Handler).serve_forever()

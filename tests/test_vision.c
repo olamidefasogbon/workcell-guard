@@ -4,7 +4,8 @@
 
 static vision_params_t params(void) {
     vision_params_t p = { .diff_threshold = 38, .cutoff_margin_px = 15, .freeze_margin_px = 30,
-                          .zone_adapt_rate = 0.002f, .cell_hit_min = 34, .min_blob_cells = 4, .warmup_frames = 20 };
+                          .zone_adapt_rate = 0.002f, .cell_hit_min = 34, .min_blob_cells = 4, .warmup_frames = 20,
+                          .learn_rate = 0.05f, .learn_quiet_frames = 30 };
     return p;
 }
 
@@ -43,14 +44,14 @@ static void settle(vision_ctx_t *c, uint8_t *f, uint32_t w, uint32_t h, const sa
 static uint8_t frame[W * H];
 
 static void test_empty_scene_and_warmup(void) {
-    TEST("empty scene: no detections; baseline becomes valid exactly after warmup");
+    TEST("empty scene: no detections; baseline valid once teach-in is done (30 quiet frames)");
     vision_ctx_t *c = vision_create(); safety_zone_t z = right_zone();
     scene(frame, W, H, 0);
     vision_result_t r = run(c, frame, W, H, 1, &z);
     CHECK(r.reseeded && !r.intrusion && r.blob_count == 0 && !r.baseline_valid, "first frame seeds, baseline not valid yet");
-    for (int i = 2; i <= 19; i++) { r = run(c, frame, W, H, 1, &z); CHECK(!r.baseline_valid, "frame %d: still warming up", i); }
+    for (int i = 2; i <= 29; i++) { r = run(c, frame, W, H, 1, &z); CHECK(!r.baseline_valid, "frame %d: still learning", i); }
     r = run(c, frame, W, H, 1, &z);
-    CHECK(r.baseline_valid && !r.intrusion && r.dist_px >= 900.0f, "valid after 20 frames, nothing detected");
+    CHECK(r.baseline_valid && !r.intrusion && r.dist_px >= 900.0f, "valid on frame 30, nothing detected");
     vision_destroy(c);
 }
 
@@ -142,8 +143,8 @@ static void test_stream_swap_epoch(void) {
     vision_result_t r = run(c, frame, W, H, 2, &z);           // epoch 1 -> 2
     CHECK(r.reseeded && !r.intrusion && r.blob_count == 0, "no false intrusion on swap");
     CHECK(!r.baseline_valid, "baseline not valid right after a swap -> reset stays blocked");
-    for (int i = 0; i < 25; i++) r = run(c, frame, W, H, 2, &z);
-    CHECK(r.baseline_valid && !r.intrusion, "baseline valid after warmup");
+    for (int i = 0; i < 35; i++) r = run(c, frame, W, H, 2, &z);
+    CHECK(r.baseline_valid && !r.intrusion, "baseline valid after teach-in");
 
     vision_ctx_t *c2 = vision_create();                       // control: same swap but forgetting the epoch bump
     scene(frame, W, H, 0); settle(c2, frame, W, H, &z, 40);
@@ -156,7 +157,7 @@ static void test_stream_swap_epoch(void) {
 static void test_frame_size_change_reseeds(void) {
     TEST("frame size change re-seeds");
     vision_ctx_t *c = vision_create(); safety_zone_t z = right_zone();
-    scene(frame, W, H, 0); settle(c, frame, W, H, &z, 25);
+    scene(frame, W, H, 0); settle(c, frame, W, H, &z, 35);
     static uint8_t small[160 * 120];
     scene(small, 160, 120, 0);
     vision_result_t r = run(c, small, 160, 120, 1, &z);
@@ -188,6 +189,76 @@ static void test_bad_arguments(void) {
     vision_destroy(c);
 }
 
+// Same patrol motion as cam_feed's synthetic operator (cosine ease, lingers near the zone centre).
+static void patrol_frame(uint8_t *f, uint32_t fid) {
+    scene(f, W, H, 0);
+    float phase = (float)(fid % 240U) / 240.0f * 2.0f * 3.1415926f, prog = 0.5f - 0.5f * cosf(phase);
+    int cx = (int)((0.12f + (0.71f - 0.12f) * prog) * W), cy = (int)(0.525f * H);
+    box(f, W, H, cx - 17, cy - 31, cx + 17, cy + 31, 225);
+}
+static int patrol_x(uint32_t fid) {
+    float phase = (float)(fid % 240U) / 240.0f * 2.0f * 3.1415926f, prog = 0.5f - 0.5f * cosf(phase);
+    return (int)((0.12f + (0.71f - 0.12f) * prog) * W);
+}
+
+static void test_restart_mid_patrol_never_leaves_a_phantom(void) {
+    TEST("REGRESSION: worker (re)start while the operator is in/near the zone must not leave a phantom tracker");
+    safety_zone_t z = right_zone();
+    const uint32_t starts[] = { 0, 40, 80, 100, 110, 120, 130, 140, 160, 200 };
+    int phantom_starts = 0, never_valid = 0, worst = 0;
+    for (unsigned k = 0; k < sizeof(starts) / sizeof(starts[0]); k++) {
+        vision_ctx_t *c = vision_create();
+        int valid_at = -1, phantoms = 0;
+        for (int i = 0; i < 800; i++) {
+            patrol_frame(frame, starts[k] + (uint32_t)i);
+            vision_result_t r = run(c, frame, W, H, 1, &z);
+            if (r.baseline_valid && valid_at < 0) valid_at = i;
+            if (valid_at >= 0 && i > valid_at + 240 && r.intrusion) {
+                int ox = patrol_x(starts[k] + (uint32_t)i);
+                if (!((int)r.bbox_x <= ox + 25 && (int)(r.bbox_x + r.bbox_w) >= ox - 25)) phantoms++;   // box not on the operator
+            }
+        }
+        if (valid_at < 0) never_valid++; else if (valid_at > worst) worst = valid_at;
+        if (phantoms) phantom_starts++;
+        vision_destroy(c);
+    }
+    CHECK(phantom_starts == 0, "%d restart phases ended with the tracker stuck away from the operator", phantom_starts);
+    CHECK(never_valid == 0, "%d restart phases never finished teach-in", never_valid);
+    CHECK(worst <= 260, "teach-in finishes within 260 frames even in the worst phase (worst %d)", worst);
+}
+
+static void test_seed_with_object_that_leaves_heals(void) {
+    TEST("a seed that contained an object which then leaves heals during teach-in (no permanent ghost)");
+    vision_ctx_t *c = vision_create(); safety_zone_t z = right_zone();
+    vision_result_t r = {0};
+    for (int i = 0; i < 6; i++) { scene(frame, W, H, 0); box(frame, W, H, 200, 90, 235, 150, 225); r = run(c, frame, W, H, 1, &z); }
+    int valid_at = -1, ghost = 0;
+    for (int i = 0; i < 400; i++) {
+        scene(frame, W, H, 0);
+        r = run(c, frame, W, H, 1, &z);
+        if (r.baseline_valid && valid_at < 0) valid_at = i;
+        if (valid_at >= 0 && r.intrusion) ghost++;
+    }
+    CHECK(valid_at > 0 && valid_at < 120, "teach-in completes once the zone is empty (valid after %d frames)", valid_at);
+    CHECK(ghost == 0, "no phantom intrusion after teach-in (%d frames)", ghost);
+    vision_destroy(c);
+}
+
+static void test_busy_zone_never_validates(void) {
+    TEST("a zone that is never quiet never gets a trusted baseline (stays fail-safe)");
+    vision_ctx_t *c = vision_create(); safety_zone_t z = right_zone();
+    int valid = 0;
+    for (int i = 0; i < 600; i++) {
+        scene(frame, W, H, 0);
+        int x = 180 + ((i / 4) % 2 ? 30 : 0) + (i % 4) * 7;     // keeps moving inside the zone
+        box(frame, W, H, x, 90, x + 35, 150, 225);
+        vision_result_t r = run(c, frame, W, H, 1, &z);
+        if (r.baseline_valid) valid++;
+    }
+    CHECK(valid == 0, "baseline must not become valid while something keeps moving in the zone (%d frames valid)", valid);
+    vision_destroy(c);
+}
+
 int main(void) {
     printf("test_vision\n");
     test_empty_scene_and_warmup();
@@ -200,5 +271,8 @@ int main(void) {
     test_frame_size_change_reseeds();
     test_outside_object_no_ghost_in_zone();
     test_bad_arguments();
+    test_restart_mid_patrol_never_leaves_a_phantom();
+    test_seed_with_object_that_leaves_heals();
+    test_busy_zone_never_validates();
     return check_summary("test_vision");
 }

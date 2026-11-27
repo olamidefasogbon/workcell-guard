@@ -28,7 +28,8 @@ typedef enum {
     FAULT_STALE_FRAME    = 4,
     FAULT_BAD_REPORT     = 5,
     FAULT_INVALID_ZONE   = 6,
-    FAULT_ZONE_MISMATCH  = 7   // vision is not evaluating the polygon the gate holds
+    FAULT_ZONE_MISMATCH  = 7,  // vision is not evaluating the polygon the gate holds
+    FAULT_BASELINE       = 8   // vision is (re)learning the background: the scene is unverified, stay stopped
 } fault_reason_t;
 
 // Result of the last reset request. A refused reset leaves the outputs off.

@@ -108,6 +108,21 @@ static void test_baseline_blocks_reset(void) {
     CHECK(gate_request_reset(&g, T) == RESET_REFUSED_SETTLING, "baseline_valid=0 must block reset");
 }
 
+static void test_baseline_loss_stops_running_machine(void) {
+    TEST("losing the verified background (vision restart / stream swap) stops a running machine");
+    safety_zone_t z = rect_zone(); gate_t g; T = 1000 * MS;
+    gate_params_t p = params(); gate_init(&g, &p, &z, T);
+    feed(&g, 0, 5); gate_request_reset(&g, T);
+    CHECK(g.state == STATE_SAFE_RUN, "running");
+    T += 33 * MS; vision_report_t r = report(0, 0, &g.zone); gate_on_report(&g, &r, T);
+    CHECK(g.state == STATE_WATCHDOG_FAULT && gate_ossd_mv(&g) == 0 && g.reason == FAULT_BASELINE, "0 V while the scene is unverified");
+    CHECK(g.trip_count == 1 && g.latched, "counted and latched");
+    for (int i = 0; i < 40; i++) { T += 33 * MS; r = report(0, 0, &g.zone); gate_on_report(&g, &r, T); }
+    CHECK(gate_request_reset(&g, T) == RESET_REFUSED_SETTLING, "reset refused while still learning");
+    feed(&g, 0, 5);
+    CHECK(gate_request_reset(&g, T) == RESET_OK && g.state == STATE_SAFE_RUN, "reset accepted once the baseline is valid and clear");
+}
+
 static void test_watchdog(void) {
     TEST("lost heartbeat -> 0 V, latched; recovered worker cannot re-energise");
     safety_zone_t z = rect_zone(); gate_t g; T = 1000 * MS;
@@ -291,6 +306,7 @@ int main(void) {
     test_intrusion_latches_and_no_snap_back();
     test_reset_refused_while_hazard_present();
     test_baseline_blocks_reset();
+    test_baseline_loss_stops_running_machine();
     test_watchdog();
     test_stale_and_bad_reports();
     test_zone_validation();

@@ -1,10 +1,17 @@
 __pycache__/
 *.py[cod]
-nul
 build/
-# QNX build outputs
+
+# QNX build outputs (rebuilt by make / deploy.sh)
 /cam_feed
 /safety_gate
 /supervisor
 /telemetry_bridge
 /vision_worker
+
+# local tooling, patches and accidents
+cloudflared.exe
+ngrok*
+*.patch
+/nul
+/-p/

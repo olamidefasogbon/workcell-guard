@@ -61,7 +61,9 @@ int main(int argc, char **argv) {
         .zone_adapt_rate  = 0.002f,
         .cell_hit_min     = (uint32_t)cfg.cell_hit_min,
         .min_blob_cells   = (uint32_t)cfg.min_blob_cells,
-        .warmup_frames    = cfg.bg_warmup_frames
+        .warmup_frames    = cfg.bg_warmup_frames,
+        .learn_rate       = 0.05f,
+        .learn_quiet_frames = (uint32_t)cfg.bg_learn_quiet_frames
     };
 
     printf("[vision_worker] Online at Prio %d | Polygon CV -> %s | stall-exit %dms\n",

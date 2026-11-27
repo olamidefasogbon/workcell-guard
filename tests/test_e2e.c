@@ -14,7 +14,8 @@ static uint32_t FID, EPOCH = 1;
 static gate_t g;
 static vision_ctx_t *vc;
 static vision_params_t vp = { .diff_threshold = 38, .cutoff_margin_px = 15, .freeze_margin_px = 30,
-                              .zone_adapt_rate = 0.002f, .cell_hit_min = 34, .min_blob_cells = 4, .warmup_frames = 20 };
+                              .zone_adapt_rate = 0.002f, .cell_hit_min = 34, .min_blob_cells = 4, .warmup_frames = 20,
+                              .learn_rate = 0.05f, .learn_quiet_frames = 30 };
 static vision_result_t last;
 
 static void scene(int bright) {
@@ -57,11 +58,11 @@ int main(void) {
     gate_init(&g, &gp, &z, T);
     vc = vision_create();
 
-    TEST("1. power-up: output OFF, reset refused while the baseline settles, accepted afterwards");
+    TEST("1. power-up: output OFF, reset refused during teach-in, accepted afterwards");
     CHECK(gate_ossd_mv(&g) == 0, "boots off");
     for (int i = 0; i < 10; i++) step(0, NOBODY);
-    CHECK(gate_request_reset(&g, T) == RESET_REFUSED_SETTLING, "too early");
-    for (int i = 0; i < 25; i++) step(0, NOBODY);
+    CHECK(gate_request_reset(&g, T) == RESET_REFUSED_SETTLING, "too early (learning the background)");
+    for (int i = 0; i < 40; i++) step(0, NOBODY);
     CHECK(gate_request_reset(&g, T) == RESET_OK && g.state == STATE_SAFE_RUN, "reset accepted -> SAFE_RUN");
 
     TEST("2. operator approaches: warning band first, then halt before contact");
@@ -85,11 +86,16 @@ int main(void) {
     CHECK(g.state == STATE_INTRUSION_HALT && gate_ossd_mv(&g) == 0, "no automatic restart");
     CHECK(gate_request_reset(&g, T) == RESET_OK && gate_ossd_mv(&g) == OSSD_ON_MV, "one click -> SAFE_RUN");
 
-    TEST("5. stream swap to bright real video: epoch bump, no false trip, no stale background");
+    TEST("5. stream swap to bright real video: machine stops while the scene is unverified, then one reset");
     EPOCH++;
+    step(1, NOBODY);
+    CHECK(g.state == STATE_WATCHDOG_FAULT && g.reason == FAULT_BASELINE && gate_ossd_mv(&g) == 0, "0 V during teach-in");
+    for (int i = 0; i < 20; i++) step(1, NOBODY);
+    CHECK(gate_request_reset(&g, T) == RESET_REFUSED_SETTLING, "reset refused until the new baseline is trusted");
     for (int i = 0; i < 40; i++) step(1, NOBODY);
-    CHECK(g.state == STATE_SAFE_RUN && g.trip_count == 1, "still running, no new trips (trips=%u)", g.trip_count);
-    CHECK(g.last_report.baseline_valid, "baseline settled again");
+    CHECK(last.intrusion == 0 && last.baseline_valid, "no stale-background intrusion; baseline valid for the new stream");
+    CHECK(gate_request_reset(&g, T) == RESET_OK && g.state == STATE_SAFE_RUN, "single deliberate reset -> SAFE_RUN");
+    CHECK(g.trip_count == 2, "exactly one extra trip for the swap (trips=%u)", g.trip_count);
 
     TEST("6. vision crash: watchdog cuts 0 V within the timeout; respawned worker cannot re-energise");
     uint64_t t_crash = T;
@@ -101,6 +107,8 @@ int main(void) {
     vc = vision_create();                                      // fresh process: new background model
     for (int i = 0; i < 40; i++) step(1, NOBODY);
     CHECK(g.state == STATE_WATCHDOG_FAULT && gate_ossd_mv(&g) == 0, "worker is back but output stays off");
+    CHECK(gate_request_reset(&g, T) == RESET_REFUSED_SETTLING, "respawned worker is still learning its background");
+    for (int i = 0; i < 20; i++) step(1, NOBODY);
     CHECK(gate_request_reset(&g, T) == RESET_OK && g.state == STATE_SAFE_RUN, "deliberate reset restores SAFE_RUN");
 
     TEST("7. invalid polygon from the UI: rejected and machine stopped; valid one accepted after reset");

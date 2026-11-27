@@ -44,6 +44,8 @@ int main(void) {
     CHECK(load_text("target_fps=5\nheartbeat_timeout_ms=500\nframe_stall_exit_ms=600\nhang_kill_ms=1000\nmax_frame_age_ms=100\n", &c) == 0, "consistent slow-camera config OK");
     CHECK(load_text("max_frame_age_ms=200\n", &c) != 0, "frame age above heartbeat timeout");
     CHECK(load_text("hang_kill_ms=200\n", &c) != 0, "hang kill must be >= 2x heartbeat");
+    CHECK(load_text("bg_learn_quiet_frames=0\n", &c) != 0, "teach-in quiet frames must be >= 1");
+    CHECK(load_text("bg_learn_quiet_frames=45\n", &c) == 0 && c.bg_learn_quiet_frames == 45, "teach-in quiet frames configurable");
 
     TEST("latch cannot be disabled in a production build");
 #ifdef WORKCELL_TEST_HOOKS

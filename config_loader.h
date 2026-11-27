@@ -42,6 +42,7 @@ typedef struct {
 
     // Vision
     uint32_t bg_warmup_frames;
+    int bg_learn_quiet_frames;  // zone must be quiet this many consecutive frames before a (re)learned background is trusted
     int diff_threshold;
     float cutoff_margin_px;
     float freeze_margin_px;
@@ -85,6 +86,7 @@ static inline void config_set_defaults(workcell_config_t *cfg) {
     cfg->sim_width               = 320;
     cfg->sim_height              = 240;
     cfg->bg_warmup_frames        = 20;
+    cfg->bg_learn_quiet_frames   = 30;
     cfg->diff_threshold          = 38;
     cfg->cutoff_margin_px        = 15.0f;
     cfg->freeze_margin_px        = 30.0f;
@@ -220,6 +222,7 @@ static inline int config_validate(const workcell_config_t *c, char *err, size_t 
         CFG_FAIL("sim_width/sim_height out of range");
 
     if (c->bg_warmup_frames < 1 || c->bg_warmup_frames > 10000) CFG_FAIL("bg_warmup_frames must be 1..10000");
+    if (c->bg_learn_quiet_frames < 1 || c->bg_learn_quiet_frames > 1000) CFG_FAIL("bg_learn_quiet_frames must be 1..1000");
     if (c->diff_threshold < 5 || c->diff_threshold > 250) CFG_FAIL("diff_threshold must be 5..250");
     if (c->cutoff_margin_px < 0.0f || c->cutoff_margin_px > 200.0f) CFG_FAIL("cutoff_margin_px must be 0..200");
     if (c->freeze_margin_px < c->cutoff_margin_px || c->freeze_margin_px > 300.0f)
@@ -295,6 +298,7 @@ static inline int config_load(const char *path, workcell_config_t *cfg) {
         else if (!strcmp(k, "sim_width"))   { int t = 0; bad = cfg_parse_int(v, 1, 100000, &t); cfg->sim_width = (uint32_t)t; }
         else if (!strcmp(k, "sim_height"))  { int t = 0; bad = cfg_parse_int(v, 1, 100000, &t); cfg->sim_height = (uint32_t)t; }
         else if (!strcmp(k, "bg_warmup_frames")) { int t = 0; bad = cfg_parse_int(v, 1, 1000000, &t); cfg->bg_warmup_frames = (uint32_t)t; }
+        else if (!strcmp(k, "bg_learn_quiet_frames"))   bad = cfg_parse_int(v, 1, 100000, &cfg->bg_learn_quiet_frames);
         else if (!strcmp(k, "diff_threshold"))          bad = cfg_parse_int(v, 1, 1000, &cfg->diff_threshold);
         else if (!strcmp(k, "cutoff_margin_px"))        bad = cfg_parse_float(v, 0.0f, 10000.0f, &cfg->cutoff_margin_px);
         else if (!strcmp(k, "freeze_margin_px"))        bad = cfg_parse_float(v, 0.0f, 10000.0f, &cfg->freeze_margin_px);

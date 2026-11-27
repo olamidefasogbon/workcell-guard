@@ -24,6 +24,7 @@
 #include "safety_protocol.h"
 
 #define VC_CELL     8U
+#define VC_QUIET_PX 16U   // at most this many foreground pixels in the zone region still counts as "quiet"
 #define VC_MAX_COLS (MAX_FRAME_DIM / VC_CELL)
 #define VC_MAX_ROWS (MAX_FRAME_DIM / VC_CELL)
 
@@ -34,7 +35,9 @@ typedef struct {
     float    zone_adapt_rate;    // very slow drift compensation inside the freeze region (scene clear only)
     uint32_t cell_hit_min;       // foreground pixels (of 64) for a cell to be active
     uint32_t min_blob_cells;     // smallest blob (in cells) that is reported
-    uint32_t warmup_frames;      // frames after a reseed before baseline_valid
+    uint32_t warmup_frames;      // minimum learning frames after a (re)seed
+    float    learn_rate;         // fast background adaptation while learning (heals a seed that contained a moving object)
+    uint32_t learn_quiet_frames; // learning ends only after the zone region has been quiet this many frames in a row
 } vision_params_t;
 
 typedef struct {
@@ -50,6 +53,8 @@ typedef struct {
     uint32_t w, h, epoch;
     int      have_stream;
     uint32_t frames_since_reseed;
+    uint32_t quiet_run;          // consecutive frames with (almost) no foreground in the zone region
+    int      learning;           // 1 until the zone region has been quiet long enough
     int      mask_valid;
     safety_zone_t mask_zone;
     uint8_t  smooth[MAX_FRAME_PIXELS];
@@ -245,6 +250,8 @@ static inline int vision_process(vision_ctx_t *c, const uint8_t *frame, uint32_t
         c->w = w; c->h = h; c->epoch = epoch; c->have_stream = 1;
         for (size_t i = 0; i < total; i++) c->bg[i] = (float)c->smooth[i];
         c->frames_since_reseed = 0;
+        c->quiet_run = 0;
+        c->learning = 1;      // teach-in: baseline_valid stays 0 until the zone has settled
         c->mask_valid = 0;
         out->reseeded = 1;
     }
@@ -347,21 +354,42 @@ static inline int vision_process(vision_ctx_t *c, const uint8_t *frame, uint32_t
     }
 
     // --- background update (after detection) ---
+    // Foreground pixels in the zone region (zone + freeze margin), measured against the background as it is now.
+    uint32_t fg_zone = 0;
     for (size_t i = 0; i < total; i++) {
-        float diff = fabsf((float)c->smooth[i] - c->bg[i]);
-        float rate;
-        if (c->freeze[i]) {
-            // Inside / next to the hazard zone: only drift-compensate while NOTHING is visible anywhere.
-            if (blobs > 0) continue;
-            rate = p->zone_adapt_rate;
-        } else {
-            rate = (diff < 18.0f) ? 0.05f : 0.005f;
+        if (c->freeze[i] && fabsf((float)c->smooth[i] - c->bg[i]) > p->diff_threshold) fg_zone++;
+    }
+    const int zone_quiet = fg_zone <= VC_QUIET_PX;
+
+    if (c->learning) {
+        // TEACH-IN. Adapt everywhere, fast: a seed that happened to contain a moving object (an operator
+        // standing in the zone when the worker started) heals within ~1 s instead of becoming a permanent
+        // phantom. Detection still runs, but baseline_valid stays 0, so the gate keeps the machine stopped
+        // and refuses a reset until the zone has been quiet for learn_quiet_frames in a row.
+        // A person who stays in the zone for the whole teach-in is learned as background: commissioning
+        // requires an empty zone, and the operator's deliberate reset is the confirmation.
+        for (size_t i = 0; i < total; i++)
+            c->bg[i] = (1.0f - p->learn_rate) * c->bg[i] + p->learn_rate * (float)c->smooth[i];
+        c->quiet_run = zone_quiet ? c->quiet_run + 1 : 0;
+        if (c->frames_since_reseed + 1 >= p->warmup_frames && c->quiet_run >= p->learn_quiet_frames) c->learning = 0;
+    } else {
+        for (size_t i = 0; i < total; i++) {
+            float diff = fabsf((float)c->smooth[i] - c->bg[i]);
+            float rate;
+            if (c->freeze[i]) {
+                // Inside / next to the hazard zone: never adapt while anything is there (a stationary
+                // intruder must not be learned); only compensate slow drift while the zone region is clear.
+                if (!zone_quiet) continue;
+                rate = p->zone_adapt_rate;
+            } else {
+                rate = (diff < 18.0f) ? 0.05f : 0.005f;
+            }
+            c->bg[i] = (1.0f - rate) * c->bg[i] + rate * (float)c->smooth[i];
         }
-        c->bg[i] = (1.0f - rate) * c->bg[i] + rate * (float)c->smooth[i];
     }
 
     if (c->frames_since_reseed < 0xFFFFFFFFU) c->frames_since_reseed++;
-    out->baseline_valid = (c->frames_since_reseed >= p->warmup_frames) ? 1 : 0;
+    out->baseline_valid = c->learning ? 0 : 1;
     return 0;
 }
 

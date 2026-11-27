@@ -264,6 +264,12 @@ static inline int gate_on_report(gate_t *g, const vision_report_t *r, uint64_t n
         return g->state != before;
     }
 
+    // Detection is only trustworthy against a verified background. A stream swap or a vision restart starts a
+    // teach-in; until it completes, the output must be off.
+    if (!r->baseline_valid && g->state == STATE_SAFE_RUN) {
+        gate_enter_fault(g, STATE_WATCHDOG_FAULT, FAULT_BASELINE, latency_us);
+    }
+
     if (r->intrusion_detected || !r->baseline_valid) {
         g->clear_streak = 0;
     } else if (g->clear_streak < GATE_STREAK_CAP) {

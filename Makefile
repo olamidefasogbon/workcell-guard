@@ -34,7 +34,7 @@ clean:
 	rm -rf build
 
 # ---- Host-side verification (no QNX required) ------------------------------
-#   make test            unit tests for the safety core, vision core, config, and an end-to-end scenario
+#   make test            unit tests for the safety core, vision core, config, dashboard, and an end-to-end scenario
 #   make check-syntax    compile-check the QNX sources against stub QNX headers
 HOSTCC    ?= cc
 HOSTFLAGS  = -std=gnu11 -Wall -Wextra -Werror -O2 -I.
@@ -47,7 +47,7 @@ build/%: tests/%.c $(COMMON) vision_core.h | build
 	$(HOSTCC) $(HOSTFLAGS) -o $@ $< -lm
 
 test: $(addprefix build/,$(TESTS))
-	@set -e; for t in $(TESTS); do echo "== $$t"; ./build/$$t; done; echo "ALL TESTS PASSED"
+	@set -e; for t in $(TESTS); do echo "== $$t"; ./build/$$t; done; echo "== test_dashboard"; python3 tests/test_dashboard.py; echo "ALL TESTS PASSED"
 
 check-syntax: | build
 	@set -e; for f in vision_worker cam_feed telemetry_bridge supervisor; do \

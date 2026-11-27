@@ -1,0 +1,6 @@
+# Normalise line endings in the repository (LF); Windows checkouts keep CRLF in the working tree.
+* text=auto
+*.sh text eol=lf
+*.c text eol=lf
+*.h text eol=lf
+*.py text eol=lf
