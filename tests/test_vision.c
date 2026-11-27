@@ -130,6 +130,39 @@ static void test_arm_is_judged_by_its_hand(void) {
     vision_destroy(c);
 }
 
+static void test_ghost_heals_and_tracker_follows_the_mover(void) {
+    TEST("REGRESSION: object rests, leaves; the empty spot it left must not keep the tracker (box follows the real mover)");
+    vision_ctx_t *c = vision_create(); safety_zone_t z = right_zone();
+    scene(frame, W, H, 0); settle(c, frame, W, H, &z, 40);
+    // hand rests 55px from the zone (outside the freeze/warn ring) for 4 s: the background partly absorbs it
+    for (int i = 0; i < 120; i++) { scene(frame, W, H, 0); box(frame, W, H, 70, 100, 105, 140, 225); run(c, frame, W, H, 1, &z); }
+    // it moves away to the left and keeps moving (small jitter); the vacated spot is nearer the zone than the hand
+    vision_result_t r = {0};
+    int wrong = 0, seen = 0;
+    for (int i = 0; i < 90; i++) {
+        int x = (i * 3) % 80; if (x > 40) x = 80 - x;   // keeps travelling at 3 px/frame, 0..40
+        scene(frame, W, H, 0); box(frame, W, H, x, 100, x + 30, 140, 225);
+        r = run(c, frame, W, H, 1, &z);
+        if (i >= 50) { seen++; if (!(r.blob_count >= 1 && r.bbox_x + r.bbox_w <= 72)) wrong++; }
+    }
+    CHECK(wrong == 0, "within 1.7 s the box is on the mover, not on the vacated spot (%d/%d frames wrong, last box x=%u w=%u)", wrong, seen, r.bbox_x, r.bbox_w);
+    vision_destroy(c);
+}
+
+static void test_still_person_in_warning_ring_is_not_learned_away(void) {
+    TEST("a person standing still inside the 45px warning ring stays detected (fast healing never applies there)");
+    vision_ctx_t *c = vision_create(); safety_zone_t z = right_zone();
+    scene(frame, W, H, 0); settle(c, frame, W, H, &z, 40);
+    int lost = 0;
+    for (int i = 0; i < 600; i++) {            // 20 s, box right edge 125 -> clearance ~35
+        scene(frame, W, H, 0); box(frame, W, H, 95, 100, 125, 140, 225);
+        vision_result_t r = run(c, frame, W, H, 1, &z);
+        if (r.blob_count < 1 || r.dist_px > 45.0f) lost++;
+    }
+    CHECK(lost == 0, "warning stays up for 20 s of standing still (%d frames lost)", lost);
+    vision_destroy(c);
+}
+
 static void test_no_blind_border(void) {
     TEST("intruder touching the frame border is detected (old code ignored a 6-16 px border band)");
     vision_ctx_t *c = vision_create();
@@ -287,6 +320,8 @@ int main(void) {
     test_warning_distance();
     test_every_blob_is_checked();
     test_arm_is_judged_by_its_hand();
+    test_ghost_heals_and_tracker_follows_the_mover();
+    test_still_person_in_warning_ring_is_not_learned_away();
     test_no_blind_border();
     test_large_frame_full_coverage();
     test_stream_swap_epoch();

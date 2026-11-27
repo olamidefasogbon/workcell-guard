@@ -25,6 +25,10 @@
 
 #define VC_CELL     8U
 #define VC_TIP_PX   56.0f // reported box covers the blob within this distance of its closest-to-zone cell (a hand, not a whole arm)
+#define VC_RING_PX  20.0f // beyond the freeze margin: the proximity-warning ring. Background is never healed fast here.
+#define VC_STILL_FRAMES 18U // a pixel unchanged this long (outside the zone region) is stale/static: adapt it fast
+#define VC_STILL_DELTA  8   // |frame - previous frame| at or below this counts as unchanged
+#define VC_STILL_RATE   0.07f
 #define VC_QUIET_PX 16U  // at most this many foreground pixels in the zone region still counts as "quiet"
 #define VC_MAX_COLS (MAX_FRAME_DIM / VC_CELL)
 #define VC_MAX_ROWS (MAX_FRAME_DIM / VC_CELL)
@@ -60,7 +64,9 @@ typedef struct {
     safety_zone_t mask_zone;
     uint8_t  smooth[MAX_FRAME_PIXELS];
     float    bg[MAX_FRAME_PIXELS];
-    uint8_t  freeze[MAX_FRAME_PIXELS];
+    uint8_t  prev[MAX_FRAME_PIXELS];      // previous smoothed frame
+    uint8_t  still[MAX_FRAME_PIXELS];     // consecutive frames this pixel has been unchanged (saturating)
+    uint8_t  freeze[MAX_FRAME_PIXELS];    // 1 = frozen (zone + freeze margin), 2 = warning ring, 0 = free
     uint8_t  active[VC_MAX_ROWS][VC_MAX_COLS];
     uint8_t  visited[VC_MAX_ROWS][VC_MAX_COLS];
     uint16_t qx[VC_MAX_ROWS * VC_MAX_COLS];
@@ -210,8 +216,9 @@ static inline void vc_build_freeze_mask(vision_ctx_t *c, const safety_zone_t *z,
         if (py[i] > maxy) maxy = py[i];
     }
     memset(c->freeze, 0, (size_t)w * h);
-    int x_lo = (int)floorf(minx - margin), x_hi = (int)ceilf(maxx + margin);
-    int y_lo = (int)floorf(miny - margin), y_hi = (int)ceilf(maxy + margin);
+    const float reach = margin + VC_RING_PX;
+    int x_lo = (int)floorf(minx - reach), x_hi = (int)ceilf(maxx + reach);
+    int y_lo = (int)floorf(miny - reach), y_hi = (int)ceilf(maxy + reach);
     if (x_lo < 0) x_lo = 0;
     if (y_lo < 0) y_lo = 0;
     if (x_hi >= (int)w) x_hi = (int)w - 1;
@@ -220,12 +227,15 @@ static inline void vc_build_freeze_mask(vision_ctx_t *c, const safety_zone_t *z,
     for (int y = y_lo; y <= y_hi; y++) {
         for (int x = x_lo; x <= x_hi; x++) {
             float fx = (float)x, fy = (float)y;
-            int frozen = vc_point_in_poly(fx, fy, px, py, n);
-            for (uint32_t i = 0; !frozen && i < n; i++) {
+            int inside = vc_point_in_poly(fx, fy, px, py, n);
+            float dmin = inside ? 0.0f : 9999.0f;
+            for (uint32_t i = 0; !inside && i < n; i++) {
                 uint32_t j = (i + 1) % n;
-                if (vc_dist_pt_to_seg(fx, fy, px[i], py[i], px[j], py[j]) <= margin) frozen = 1;
+                float d = vc_dist_pt_to_seg(fx, fy, px[i], py[i], px[j], py[j]);
+                if (d < dmin) dmin = d;
             }
-            if (frozen) c->freeze[(size_t)y * w + (size_t)x] = 1;
+            if (dmin <= margin) c->freeze[(size_t)y * w + (size_t)x] = 1;
+            else if (dmin <= reach) c->freeze[(size_t)y * w + (size_t)x] = 2;
         }
     }
 }
@@ -250,6 +260,8 @@ static inline int vision_process(vision_ctx_t *c, const uint8_t *frame, uint32_t
     if (!c->have_stream || w != c->w || h != c->h || epoch != c->epoch) {
         c->w = w; c->h = h; c->epoch = epoch; c->have_stream = 1;
         for (size_t i = 0; i < total; i++) c->bg[i] = (float)c->smooth[i];
+        memcpy(c->prev, c->smooth, total);
+        memset(c->still, 0, total);
         c->frames_since_reseed = 0;
         c->quiet_run = 0;
         c->learning = 1;      // teach-in: baseline_valid stays 0 until the zone has settled
@@ -379,7 +391,7 @@ static inline int vision_process(vision_ctx_t *c, const uint8_t *frame, uint32_t
     // Foreground pixels in the zone region (zone + freeze margin), measured against the background as it is now.
     uint32_t fg_zone = 0;
     for (size_t i = 0; i < total; i++) {
-        if (c->freeze[i] && fabsf((float)c->smooth[i] - c->bg[i]) > p->diff_threshold) fg_zone++;
+        if (c->freeze[i] == 1 && fabsf((float)c->smooth[i] - c->bg[i]) > p->diff_threshold) fg_zone++;
     }
     const int zone_quiet = fg_zone <= VC_QUIET_PX;
 
@@ -398,18 +410,29 @@ static inline int vision_process(vision_ctx_t *c, const uint8_t *frame, uint32_t
         for (size_t i = 0; i < total; i++) {
             float diff = fabsf((float)c->smooth[i] - c->bg[i]);
             float rate;
-            if (c->freeze[i]) {
+            int d_prev = (int)c->smooth[i] - (int)c->prev[i];
+            if (d_prev < 0) d_prev = -d_prev;
+            if (d_prev <= VC_STILL_DELTA) { if (c->still[i] < 255) c->still[i]++; } else c->still[i] = 0;
+            if (c->freeze[i] == 1) {
                 // Inside / next to the hazard zone: never adapt while anything is there (a stationary
                 // intruder must not be learned); only compensate slow drift while the zone region is clear.
                 if (!zone_quiet) continue;
                 rate = p->zone_adapt_rate;
             } else {
-                rate = (diff < 18.0f) ? 0.05f : 0.005f;
+                // Warning ring: follows lighting drift (small diffs) but a person standing still there is learned
+                // away only over ~25 s instead of ~7 s, so the proximity warning holds while they stay.
+                rate = (diff < 18.0f) ? 0.05f : (c->freeze[i] == 2 ? p->zone_adapt_rate : 0.005f);
+                // Stale/static foreground well away from the zone (an object that rested and left, or one that
+                // has stopped): heal it quickly so the tracker follows the real mover. A moving object changes
+                // its pixels and never reaches VC_STILL_FRAMES; the warning ring is excluded so a person
+                // standing still next to the zone is not learned away.
+                if (c->freeze[i] == 0 && c->still[i] >= VC_STILL_FRAMES) rate = VC_STILL_RATE;
             }
             c->bg[i] = (1.0f - rate) * c->bg[i] + rate * (float)c->smooth[i];
         }
     }
 
+    memcpy(c->prev, c->smooth, total);
     if (c->frames_since_reseed < 0xFFFFFFFFU) c->frames_since_reseed++;
     out->baseline_valid = c->learning ? 0 : 1;
     return 0;
