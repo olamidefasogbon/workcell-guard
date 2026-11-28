@@ -184,6 +184,50 @@ static void test_ghost_in_warning_ring_clears_when_scene_is_clean_again(void) {
     vision_destroy(c);
 }
 
+static void test_baseline_contaminated_at_the_freeze_edge_heals(void) {
+    TEST("REGRESSION: object in view at the end of teach-in leaves; its ghost at the freeze edge must not lock forever");
+    vision_ctx_t *c = vision_create(); safety_zone_t z = right_zone();
+    // an object 30px from the zone (right on the freeze-margin edge) is present during the whole teach-in
+    for (int i = 0; i < 60; i++) { scene(frame, W, H, 0); box(frame, W, H, 100, 100, 130, 140, 225); run(c, frame, W, H, 1, &z); }
+    int gone_at = -1; vision_result_t r;
+    for (int i = 0; i < 900; i++) {                       // object leaves; 30 s of empty scene
+        scene(frame, W, H, 0);
+        r = run(c, frame, W, H, 1, &z);
+        if (gone_at < 0 && r.blob_count == 0) gone_at = i;
+    }
+    CHECK(gone_at >= 0 && gone_at < 10, "ghost cleared after %d frames (was 802 = 27 s)", gone_at);
+    vision_destroy(c);
+}
+
+static void test_ghost_test_never_wipes_a_real_object(void) {
+    TEST("the ghost test never hides real objects: still ones in the ring, ones inside the trip distance, flat ones over a pattern");
+    vision_ctx_t *c = vision_create(); safety_zone_t z = right_zone();
+    scene(frame, W, H, 0); settle(c, frame, W, H, &z, 40);
+    // (a) dark object resting in the warning ring for 10 s
+    int lost = 0;
+    for (int i = 0; i < 300; i++) { scene(frame, W, H, 0); box(frame, W, H, 95, 100, 125, 140, 225); vision_result_t r = run(c, frame, W, H, 1, &z); if (r.blob_count < 1) lost++; }
+    CHECK(lost == 0, "(a) object resting in the ring stays reported (%d lost)", lost);
+    vision_destroy(c);
+    // (b) object inside the trip distance, 20 s: always an intrusion
+    c = vision_create(); scene(frame, W, H, 0); settle(c, frame, W, H, &z, 40);
+    lost = 0;
+    for (int i = 0; i < 600; i++) { scene(frame, W, H, 0); box(frame, W, H, 120, 100, 150, 140, 225); vision_result_t r = run(c, frame, W, H, 1, &z); if (!r.intrusion) lost++; }
+    CHECK(lost == 0, "(b) object 10px from the zone trips for 20 s (%d lost)", lost);
+    vision_destroy(c);
+    // (c) bright flat object over a high-contrast bar pattern, resting in the ring for 10 s
+    c = vision_create();
+    for (uint32_t y = 0; y < H; y++) for (uint32_t x = 0; x < W; x++) frame[y * W + x] = (uint8_t)(((x / 6) & 1) ? 90 : 150);
+    settle(c, frame, W, H, &z, 40);
+    lost = 0;
+    for (int i = 0; i < 300; i++) {
+        for (uint32_t y = 0; y < H; y++) for (uint32_t x = 0; x < W; x++) frame[y * W + x] = (uint8_t)(((x / 6) & 1) ? 90 : 150);
+        box(frame, W, H, 95, 100, 125, 140, 250);
+        vision_result_t r = run(c, frame, W, H, 1, &z); if (r.blob_count < 1) lost++;
+    }
+    CHECK(lost < 10, "(c) flat object over a pattern is not wiped as a ghost for 10 s (%d frames lost)", lost);
+    vision_destroy(c);
+}
+
 static void test_no_blind_border(void) {
     TEST("intruder touching the frame border is detected (old code ignored a 6-16 px border band)");
     vision_ctx_t *c = vision_create();
@@ -344,6 +388,8 @@ int main(void) {
     test_ghost_heals_and_tracker_follows_the_mover();
     test_still_person_in_warning_ring_is_not_learned_away();
     test_ghost_in_warning_ring_clears_when_scene_is_clean_again();
+    test_baseline_contaminated_at_the_freeze_edge_heals();
+    test_ghost_test_never_wipes_a_real_object();
     test_no_blind_border();
     test_large_frame_full_coverage();
     test_stream_swap_epoch();

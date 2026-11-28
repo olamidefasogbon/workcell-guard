@@ -30,6 +30,7 @@
 #define VC_STILL_DELTA  8   // |frame - previous frame| at or below this counts as unchanged
 #define VC_STILL_RATE   0.07f
 #define VC_REF_MATCH 14   // frame within this of the clean reference = nothing stands here (below diff_threshold, above sensor noise)
+#define VC_GHOST_EDGE 1.5 // mean-gradient margin: background edges must clearly exceed live-frame edges to call a blob a ghost
 #define VC_QUIET_PX 16U  // at most this many foreground pixels in the zone region still counts as "quiet"
 #define VC_MAX_COLS (MAX_FRAME_DIM / VC_CELL)
 #define VC_MAX_ROWS (MAX_FRAME_DIM / VC_CELL)
@@ -332,7 +333,25 @@ static inline int vision_process(vision_ctx_t *c, const uint8_t *frame, uint32_t
                 }
             }
             if (tail < p->min_blob_cells) continue;
-            blobs++;
+
+            // GHOST TEST (edge comparison). A real object has edges in the LIVE frame (it stands out against
+            // the wall); a ghost - a spot where the learned background still holds an object that has since
+            // left - has its edges in the BACKGROUND while the live frame there is flat wall.
+            double g_live = 0.0, g_bg = 0.0; size_t g_px = 0;
+            for (uint32_t k = 0; k < tail; k++) {
+                uint32_t gx0 = c->qx[k] * VC_CELL, gy0 = c->qy[k] * VC_CELL;
+                for (uint32_t yy = gy0; yy < gy0 + VC_CELL; yy++) {
+                    if (yy < 1 || yy + 1 >= h) continue;
+                    for (uint32_t xx = gx0; xx < gx0 + VC_CELL; xx++) {
+                        if (xx < 1 || xx + 1 >= w) continue;
+                        size_t i = (size_t)yy * w + xx;
+                        g_live += fabsf((float)c->smooth[i + 1] - (float)c->smooth[i - 1]) + fabsf((float)c->smooth[i + w] - (float)c->smooth[i - w]);
+                        g_bg   += fabsf(c->bg[i + 1] - c->bg[i - 1]) + fabsf(c->bg[i + w] - c->bg[i - w]);
+                        g_px++;
+                    }
+                }
+            }
+            const int ghost = g_px > 0 && (g_bg / (double)g_px) > 2.0 * (g_live / (double)g_px) + VC_GHOST_EDGE;
 
             // Distance is measured per CELL of the blob (the real shape), not per bounding rectangle:
             // an arm reaching in from the edge is judged by its hand, and an L-shaped blob whose
@@ -350,6 +369,22 @@ static inline int vision_process(vision_ctx_t *c, const uint8_t *frame, uint32_t
                 if (cd < d) { d = cd; tip = k; }
             }
             if (!intr && d <= p->cutoff_margin_px) intr = 1;
+
+            // A ghost that is not within trip distance is a defect of the background, not an object: restore the
+            // background from the live frame (outside the trip region) and do not report it. A ghost that IS
+            // within trip distance stays a (fail-safe) intrusion until the scene is re-taught.
+            if (ghost && !intr) {
+                for (uint32_t k = 0; k < tail; k++) {
+                    uint32_t gx0 = c->qx[k] * VC_CELL, gy0 = c->qy[k] * VC_CELL;
+                    for (uint32_t yy = gy0; yy < gy0 + VC_CELL && yy < h; yy++)
+                        for (uint32_t xx = gx0; xx < gx0 + VC_CELL && xx < w; xx++) {
+                            size_t i = (size_t)yy * w + xx;
+                            if (c->freeze[i] != 1) c->bg[i] = (float)c->smooth[i];
+                        }
+                }
+                continue;
+            }
+            blobs++;
 
             // Reported box = the leading tip (the part of the blob nearest the zone, VC_TIP_PX around
             // the closest cell), tightened to foreground pixels. Display only; it never drives the output.
