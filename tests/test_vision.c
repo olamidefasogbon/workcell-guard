@@ -163,6 +163,27 @@ static void test_still_person_in_warning_ring_is_not_learned_away(void) {
     vision_destroy(c);
 }
 
+static void test_ghost_in_warning_ring_clears_when_scene_is_clean_again(void) {
+    TEST("REGRESSION: hand rests near the zone for a long time, leaves the scene entirely: no tracker box left on empty wall");
+    vision_ctx_t *c = vision_create(); safety_zone_t z = right_zone();
+    scene(frame, W, H, 0); settle(c, frame, W, H, &z, 40);
+    // rests 35px from the zone (warning ring) for 20 s, so the slow ring adaptation absorbs most of it
+    for (int i = 0; i < 600; i++) { scene(frame, W, H, 0); box(frame, W, H, 95, 100, 125, 140, 225); run(c, frame, W, H, 1, &z); }
+    // hand leaves the scene completely
+    int leftover = 0; vision_result_t r;
+    for (int i = 0; i < 30; i++) {
+        scene(frame, W, H, 0);
+        r = run(c, frame, W, H, 1, &z);
+        if (i >= 5 && (r.blob_count != 0 || r.dist_px < 900.0f)) leftover++;
+    }
+    CHECK(leftover == 0, "empty scene reports nothing after 5 frames (%d of 25 frames still tracked a ghost, last dist %.1f)", leftover, r.dist_px);
+    // ...and a real object appearing at the same spot is detected at once (clean reference must not blind it)
+    scene(frame, W, H, 0); box(frame, W, H, 95, 100, 125, 140, 225);
+    r = run(c, frame, W, H, 1, &z);
+    CHECK(r.blob_count >= 1 && r.dist_px < 45.0f, "object returning to the same spot is seen immediately (dist %.1f)", r.dist_px);
+    vision_destroy(c);
+}
+
 static void test_no_blind_border(void) {
     TEST("intruder touching the frame border is detected (old code ignored a 6-16 px border band)");
     vision_ctx_t *c = vision_create();
@@ -322,6 +343,7 @@ int main(void) {
     test_arm_is_judged_by_its_hand();
     test_ghost_heals_and_tracker_follows_the_mover();
     test_still_person_in_warning_ring_is_not_learned_away();
+    test_ghost_in_warning_ring_clears_when_scene_is_clean_again();
     test_no_blind_border();
     test_large_frame_full_coverage();
     test_stream_swap_epoch();

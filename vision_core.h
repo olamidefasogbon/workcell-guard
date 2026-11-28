@@ -29,6 +29,7 @@
 #define VC_STILL_FRAMES 18U // a pixel unchanged this long (outside the zone region) is stale/static: adapt it fast
 #define VC_STILL_DELTA  8   // |frame - previous frame| at or below this counts as unchanged
 #define VC_STILL_RATE   0.07f
+#define VC_REF_MATCH 14   // frame within this of the clean reference = nothing stands here (below diff_threshold, above sensor noise)
 #define VC_QUIET_PX 16U  // at most this many foreground pixels in the zone region still counts as "quiet"
 #define VC_MAX_COLS (MAX_FRAME_DIM / VC_CELL)
 #define VC_MAX_ROWS (MAX_FRAME_DIM / VC_CELL)
@@ -64,6 +65,8 @@ typedef struct {
     safety_zone_t mask_zone;
     uint8_t  smooth[MAX_FRAME_PIXELS];
     float    bg[MAX_FRAME_PIXELS];
+    uint8_t  ref[MAX_FRAME_PIXELS];       // clean-scene snapshot taken when teach-in ends (never adapts)
+    int      ref_valid;
     uint8_t  prev[MAX_FRAME_PIXELS];      // previous smoothed frame
     uint8_t  still[MAX_FRAME_PIXELS];     // consecutive frames this pixel has been unchanged (saturating)
     uint8_t  freeze[MAX_FRAME_PIXELS];    // 1 = frozen (zone + freeze margin), 2 = warning ring, 0 = free
@@ -262,6 +265,7 @@ static inline int vision_process(vision_ctx_t *c, const uint8_t *frame, uint32_t
         for (size_t i = 0; i < total; i++) c->bg[i] = (float)c->smooth[i];
         memcpy(c->prev, c->smooth, total);
         memset(c->still, 0, total);
+        c->ref_valid = 0;
         c->frames_since_reseed = 0;
         c->quiet_run = 0;
         c->learning = 1;      // teach-in: baseline_valid stays 0 until the zone has settled
@@ -405,7 +409,12 @@ static inline int vision_process(vision_ctx_t *c, const uint8_t *frame, uint32_t
         for (size_t i = 0; i < total; i++)
             c->bg[i] = (1.0f - p->learn_rate) * c->bg[i] + p->learn_rate * (float)c->smooth[i];
         c->quiet_run = zone_quiet ? c->quiet_run + 1 : 0;
-        if (c->frames_since_reseed + 1 >= p->warmup_frames && c->quiet_run >= p->learn_quiet_frames) c->learning = 0;
+        if (c->frames_since_reseed + 1 >= p->warmup_frames && c->quiet_run >= p->learn_quiet_frames) {
+            c->learning = 0;
+            // The verified-quiet scene becomes the clean reference used to cancel ghosts (see below).
+            for (size_t i = 0; i < total; i++) c->ref[i] = (uint8_t)(c->bg[i] + 0.5f);
+            c->ref_valid = 1;
+        }
     } else {
         for (size_t i = 0; i < total; i++) {
             float diff = fabsf((float)c->smooth[i] - c->bg[i]);
@@ -413,6 +422,15 @@ static inline int vision_process(vision_ctx_t *c, const uint8_t *frame, uint32_t
             int d_prev = (int)c->smooth[i] - (int)c->prev[i];
             if (d_prev < 0) d_prev = -d_prev;
             if (d_prev <= VC_STILL_DELTA) { if (c->still[i] < 255) c->still[i]++; } else c->still[i] = 0;
+            // GHOST CANCEL. If the live frame matches the clean reference, nothing stands at this pixel, so
+            // whatever the adaptive background learned here (a hand that rested, an object that left) is
+            // contamination: restore it immediately. A real object never matches the clean scene, so this
+            // cannot hide one; it only removes trackers left on empty wall, in every region incl. the ring.
+            if (c->ref_valid && diff > 18.0f &&
+                fabsf((float)c->smooth[i] - (float)c->ref[i]) <= (float)VC_REF_MATCH) {
+                c->bg[i] = (float)c->smooth[i];
+                continue;
+            }
             if (c->freeze[i] == 1) {
                 // Inside / next to the hazard zone: never adapt while anything is there (a stationary
                 // intruder must not be learned); only compensate slow drift while the zone region is clear.
